@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.streamlit/secrets.toml
+.local/
+.claude/
+.env
+.env.*
+*.db
+*.sqlite
+*.sqlite3
+*.log
+.DS_Store
+
+*.csv
