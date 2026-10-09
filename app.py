@@ -3,19 +3,27 @@ import streamlit as st
 st.set_page_config(page_title="AI Literature Review Platform", page_icon="🔎", layout="wide")
 
 from core import auth
-from features.screening import state
+from features.workflow import state
 
 auth.require_login()
 
-projects = st.Page("views/projects.py", title="My Projects", default=True)
-screening = st.Page("views/relevance_screening.py", title="Relevance Screening")
-summary = st.Page("views/review_summary.py", title="Review Summary")
+projects_page = st.Page("views/projects.py", title="My Projects", default=True)
+abstract_page = st.Page("views/abstract_screening.py", title="Abstract Screening")
+fulltext_page = st.Page("views/fulltext_screening.py", title="Full-text Screening")
+extraction_page = st.Page("views/extraction.py", title="Data Extraction")
+summary_page = st.Page("views/review_summary.py", title="Review Summary")
 
-pages = [projects]
-if state.active_id():
-    pages += [screening, summary]
+state.require_saved_results()
+
+pages = [projects_page]
+if state.active_id() and state.loaded():
+    if state.mode() == state.MODE_PRISMA:
+        pages += [abstract_page]
+    pages += [fulltext_page, extraction_page, summary_page]
 
 navigation = st.navigation(pages)
-if state.active_id() and st.session_state.pop("_go_screening", False):
-    st.switch_page("views/relevance_screening.py")
+if state.active_id() and state.loaded() and st.session_state.pop("_go_workflow", False):
+    first = ("views/abstract_screening.py" if state.mode() == state.MODE_PRISMA
+             else "views/fulltext_screening.py")
+    st.switch_page(first)
 navigation.run()

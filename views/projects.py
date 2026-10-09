@@ -1,13 +1,15 @@
 import streamlit as st
 
-from core import auth, db, ui
-from features.screening import state
+from core import auth, db, fulltext_storage, ui
+from features.workflow import state
 
 ui.inject_base_css()
 auth.sidebar_user()
 ui.app_header("My Projects", "Create a project, open one to keep working, or delete it.")
 
 user = auth.current_user()
+state.require_saved_results()
+ui.pending_file_cleanup()
 
 
 def _stop_on_db_error(exc: db.DatabaseError) -> None:
@@ -16,16 +18,40 @@ def _stop_on_db_error(exc: db.DatabaseError) -> None:
 
 with st.container(border=True):
     st.subheader("New project")
-    name = st.text_input("Project name", placeholder="e.g., Flood social-media + remote-sensing review")
-    if st.button("Create", type="primary", disabled=not name.strip()):
-        try:
-            pid = db.create_project(user, name.strip(), {})
-        except db.DatabaseError as exc:
-            _stop_on_db_error(exc)
-        state.set_active(pid, name.strip())
-        state.restore({})
-        st.session_state["_go_screening"] = True
-        st.rerun()
+    name = st.text_input(
+        "Project name *",
+        placeholder="e.g., Flood social-media + remote-sensing review",
+        help="A name is required before the project can be created.",
+    )
+    mode_keys = [state.MODE_PRISMA, state.MODE_DIRECT]
+    mode_label = st.radio(
+        "Workflow",
+        [state.MODE_LABELS[m] for m in mode_keys],
+        captions=[state.MODE_DESCRIPTIONS[m] for m in mode_keys],
+    )
+    mode = mode_keys[[state.MODE_LABELS[m] for m in mode_keys].index(mode_label)]
+    next_step = (
+        "After creation, you will go to Abstract Screening to upload the CSV."
+        if mode == state.MODE_PRISMA
+        else "After creation, you will go to Full-text Screening to upload the PDFs."
+    )
+    st.info(next_step)
+    st.caption("The workflow mode is fixed once the project is created.")
+    if st.button("Create and continue →", type="primary"):
+        if not name.strip():
+            st.error(
+                "Enter a project name first. The CSV or PDF upload appears on the next page."
+            )
+        else:
+            data = state.new_project_data(mode)
+            try:
+                pid = db.create_project(user, name.strip(), data)
+            except db.DatabaseError as exc:
+                _stop_on_db_error(exc)
+            state.set_active(pid, name.strip())
+            state.load_into_session(data, version=1, project_id=pid, source=([], []))
+            st.session_state["_go_workflow"] = True
+            st.rerun()
 
 with st.container(border=True):
     st.subheader("Your projects")
@@ -43,17 +69,21 @@ with st.container(border=True):
         info_col.markdown(f"**{name}**" + ("  ·  *open*" if is_active else ""))
         info_col.caption(f"updated {str(row['updated_at'])[:16].replace('T', ' ')}")
 
-        if open_col.button("Open", key=f"open_{pid}", use_container_width=True):
-            state.set_active(pid, name)
+        if open_col.button("Open", key=f"open_{pid}", width="stretch"):
             try:
-                state.restore(db.load_project(user, pid))
+                # Activate only after loading succeeds.
+                state.reload_project(pid)
+                state.set_active(pid, name)
             except db.DatabaseError as exc:
                 _stop_on_db_error(exc)
-            st.session_state["_go_screening"] = True
+            except state.UnsupportedSchemaError as exc:
+                st.error(str(exc))
+                st.stop()
+            st.session_state["_go_workflow"] = True
             st.rerun()
-        if ren_col.button("Rename", key=f"ren_{pid}", use_container_width=True):
+        if ren_col.button("Rename", key=f"ren_{pid}", width="stretch"):
             st.session_state[f"renaming_{pid}"] = True
-        if del_col.button("Delete", key=f"del_{pid}", use_container_width=True):
+        if del_col.button("Delete", key=f"del_{pid}", width="stretch"):
             st.session_state[f"confirm_del_{pid}"] = True
 
         if st.session_state.get(f"renaming_{pid}"):
@@ -73,12 +103,21 @@ with st.container(border=True):
             yes_col, no_col, _ = st.columns([2, 2, 6])
             if yes_col.button("Yes, delete", key=f"yesdel_{pid}", type="primary"):
                 try:
+                    attached = db.load_fulltexts(user, pid)
+                    saved_data, _ = db.load_project_versioned(user, pid)
+                    cleanup_keys = [entry.get("storage_key") for entry in saved_data.get("pending_pdf_deletions", [])]
                     db.delete_project(user, pid)
                 except db.DatabaseError as exc:
                     _stop_on_db_error(exc)
+                try:
+                    fulltext_storage.delete_many(
+                        [m.get("storage_key") for m in attached.values() if m.get("storage_key")] + cleanup_keys
+                    )
+                except fulltext_storage.FulltextStorageError as exc:
+                    st.session_state.setdefault("_uncommitted_pdf_cleanup", []).extend(exc.failed_keys)
                 if is_active:
                     state.set_active(None, None)
-                    state.restore({})
+                    state.clear_session()
                 st.session_state.pop(f"confirm_del_{pid}", None)
                 st.rerun()
             if no_col.button("Cancel", key=f"nodel_{pid}"):

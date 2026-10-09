@@ -18,7 +18,7 @@ def read_csv(uploaded_file) -> pd.DataFrame:
     last_error: Exception | None = None
     for encoding in ("utf-8-sig", "utf-8", "latin-1"):
         try:
-            return pd.read_csv(io.BytesIO(raw), encoding=encoding)
+            return pd.read_csv(io.BytesIO(raw), encoding=encoding, dtype=str, keep_default_na=False)
         except Exception as exc:
             last_error = exc
     raise ValueError(f"Could not read the CSV file; check its format or encoding: {last_error}")
@@ -35,8 +35,20 @@ def guess_column(columns: list[str], candidates: list[str]) -> str | None:
         col_lower = str(col).lower()
         if any(cand in col_lower for cand in candidates):
             return col
-    return columns[0]
+    # Require manual mapping when no column matches.
+    return None
+
+
+def _excel_safe(value):
+    if isinstance(value, str) and (
+        value.startswith(("\t", "\r", "\n")) or value.lstrip().startswith(("=", "+", "-", "@"))
+    ):
+        return "'" + value
+    return value
 
 
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8-sig")
+    """Escape formula-like cells and headers without changing source data."""
+    safe = df.apply(lambda column: column.map(_excel_safe))
+    safe.columns = [_excel_safe(column) for column in df.columns]
+    return safe.to_csv(index=False).encode("utf-8-sig")
