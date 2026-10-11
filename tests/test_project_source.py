@@ -32,16 +32,16 @@ def session(monkeypatch):
 
 
 def test_round_trip_and_project_delete_cleans_up(engine):
-    db.create_project("r@example.com", "Study", {})
-    db.save_project_source("r@example.com", "p1", ["Title"], [{"Title": "A study"}])
-    assert db.load_project_source("r@example.com", "p1") == (["Title"], [{"Title": "A study"}])
-    assert db.load_project_source("other@example.com", "p1") == ([], [])
+    pid = db.create_project("r@example.com", "Study", {})
+    db.save_project_source("r@example.com", pid, ["Title"], [{"Title": "A study"}])
+    assert db.load_project_source("r@example.com", pid) == (["Title"], [{"Title": "A study"}])
+    assert db.load_project_source("other@example.com", pid) == ([], [])
 
-    db.save_project_source("r@example.com", "p1", ["Title"], [{"Title": "Replaced"}])
-    assert db.load_project_source("r@example.com", "p1")[1] == [{"Title": "Replaced"}]
+    db.save_project_source("r@example.com", pid, ["Title"], [{"Title": "Replaced"}])
+    assert db.load_project_source("r@example.com", pid)[1] == [{"Title": "Replaced"}]
 
-    db.delete_project("r@example.com", "p1")
-    assert db.load_project_source("r@example.com", "p1") == ([], [])
+    db.delete_project("r@example.com", pid)
+    assert db.load_project_source("r@example.com", pid) == ([], [])
 
 
 def test_snapshot_no_longer_carries_the_spreadsheet(session):
@@ -52,13 +52,13 @@ def test_snapshot_no_longer_carries_the_spreadsheet(session):
 
 def test_pending_source_is_offered_once_and_written_with_the_document(session, monkeypatch):
     """Atomic imports prevent pairing papers with another import's rows."""
-    session.session_state[state._SOURCE_KEY] = True
+    state._store()[state._SOURCE_KEY] = True
     assert state._pending_source() == (["Title", "Abstract"],
                                        [{"Title": "A study", "Abstract": "Abstract"}])
 
     calls = []
 
-    def fake_save(user_email, pid, data, expected_version=None, source=None):
+    def fake_save(user_email, pid, data, expected_version=None, source=None, **options):
         calls.append({"data_keys": sorted(data), "source": source})
         return 7
 
@@ -69,7 +69,7 @@ def test_pending_source_is_offered_once_and_written_with_the_document(session, m
     assert state.save_active() is True
     assert calls[0]["source"][1] == [{"Title": "A study", "Abstract": "Abstract"}]
     assert "original_records" not in calls[0]["data_keys"]
-    assert session.session_state[state._SOURCE_KEY] is False
+    assert state._store()[state._SOURCE_KEY] is False
 
     assert state.save_active() is True
     assert calls[1]["source"] is None
@@ -82,10 +82,10 @@ def test_a_failed_save_keeps_the_spreadsheet_owed(session, monkeypatch):
     monkeypatch.setattr(db, "save_project", boom)
     monkeypatch.setattr(state.auth, "current_user", lambda: "r@example.com")
     session.session_state["active_project_id"] = "p1"
-    session.session_state[state._SOURCE_KEY] = True
+    state._store()[state._SOURCE_KEY] = True
 
     assert state.save_active() is False
-    assert session.session_state[state._SOURCE_KEY] is True
+    assert state._store()[state._SOURCE_KEY] is True
 
 
 def test_a_legacy_document_moves_its_spreadsheet_to_the_side_table(session):
@@ -98,7 +98,7 @@ def test_a_legacy_document_moves_its_spreadsheet_to_the_side_table(session):
         "original_records": [{"Title": "Legacy row"}],
         "cursors": {},
     }, version=4)
-    assert session.session_state[state._SOURCE_KEY] is True
+    assert state._store()[state._SOURCE_KEY] is True
     assert state._store()["original_df"].to_dict("records") == [{"Title": "Legacy row"}]
     assert state.project_version() == 4
 
@@ -137,5 +137,5 @@ def test_a_version_3_document_still_opens_and_is_upgraded(session):
         "cursors": {},
     }, version=2)
     assert state._store()["original_df"].to_dict("records") == [{"Title": "Legacy row"}]
-    assert session.session_state[state._SOURCE_KEY] is True
+    assert state._store()[state._SOURCE_KEY] is True
     assert state.snapshot()["schema_version"] == state.SCHEMA_VERSION

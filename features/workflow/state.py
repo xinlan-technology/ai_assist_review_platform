@@ -22,7 +22,7 @@ import streamlit as st
 
 from core import auth, db
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 MODE_DIRECT = "direct"
 MODE_PRISMA = "prisma"
@@ -83,12 +83,16 @@ ABSTRACT_ADVANCE = (VERDICT_INCLUDE, VERDICT_UNSURE)
 _AI_FIELDS = (
     "ai_verdict", "ai_reason", "ai_error", "ai_error_kind",
     "provider", "model", "criteria_hash", "prompt_version", "completed_at",
+    "source_run_id",
 )
 
 _KEY = "project_store"
+_PROJECT_ID_KEY = "project_id"
 _VERSION_KEY = "project_version"
 _SOURCE_KEY = "project_source_unsaved"
 _CONFLICT_KEY = "project_conflict"
+_UNSAVED_KEY = "unsaved_results"
+_RUNS_MIGRATED_KEY = "ai_runs_migrated"
 
 
 class UnsupportedSchemaError(RuntimeError):
@@ -130,6 +134,7 @@ def new_project_data(mode: str) -> dict:
         "original_columns": [],
         "original_records": [],
         "cursors": {},
+        _RUNS_MIGRATED_KEY: True,
     }
 
 
@@ -271,9 +276,7 @@ def archive_ai_result(paper: dict, stage: str) -> None:
     entry["human_verdict"] = s.get("human_verdict")
     entry["review_criteria_hash"] = s.get("review_criteria_hash")
     entry["archived_at"] = _now()
-    history = s.setdefault("history", [])
-    history.append(entry)
-    s["history"] = history[-10:]
+    s.setdefault("history", []).append(entry)
     for key in _AI_FIELDS:
         s.pop(key, None)
     s.pop("review_criteria_hash", None)
@@ -318,7 +321,6 @@ def archive_document_results(paper: dict, old_hash: str | None, new_hash: str) -
 
 def eligible_papers(papers_list: list[dict], mode: str, stage: str,
                     hashes: dict[str, str]) -> list[tuple[int, dict]]:
-    """Return eligible (index, paper) pairs using each stage's current hash."""
     pairs = list(enumerate(papers_list))
     if stage == STAGE_ABSTRACT:
         return pairs
@@ -453,6 +455,8 @@ def _migrate_v1(data: dict) -> dict:
     threshold = int(data.get("threshold", 80))
     rubric = data.get("rubric") or []
     out = new_project_data(MODE_PRISMA)
+    # Its AI results predate recorded attempts, so the first save must import them.
+    out.pop(_RUNS_MIGRATED_KEY)
     criteria = _v1_criteria_text(str(data.get("topic", "") or ""), rubric, threshold)
     out["config"]["abstract_criteria"] = criteria
     chash = criteria_hash(criteria)
@@ -502,7 +506,7 @@ def migrate(data: dict) -> dict:
     if version is None or version == 1:
         return _migrate_v1(data)
     # Schemas 2 and 3 store the spreadsheet inline; schema 4 uses a table.
-    if version not in (2, 3, SCHEMA_VERSION):
+    if version not in (2, 3, 4, SCHEMA_VERSION):
         raise UnsupportedSchemaError(
             f"This project was saved with a newer version of the platform "
             f"(schema {version}, this app reads schema {SCHEMA_VERSION}). "
@@ -530,12 +534,17 @@ def active_name() -> str | None:
 
 
 def set_active(pid: str | None, name: str | None) -> None:
+    # A store without an owner belongs to the project that was active when it loaded.
+    previous_id = active_id()
+    store = st.session_state.get(_KEY)
+    if store is not None:
+        store.setdefault(_PROJECT_ID_KEY, previous_id)
     st.session_state["active_project_id"] = pid
     st.session_state["active_project_name"] = name
 
 
 def _as_version(value: object) -> int:
-    """Coerce a stored/returned row version; 0 means "unknown, save anyway"."""
+    """Coerce a stored/returned row version; 0 means unknown."""
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -544,63 +553,74 @@ def _as_version(value: object) -> int:
 
 def project_version() -> int:
     """Row version this session last read or wrote; 0 when unknown."""
-    return _as_version(st.session_state.get(_VERSION_KEY, 0))
+    return _as_version(_store().get(_VERSION_KEY, 0))
 
 
 def load_into_session(data: dict, version: int | None = None,
-                      source_df: pd.DataFrame | None = None,
                       project_id: str | None = None,
-                      source: tuple[list, list] | None = None) -> None:
+                      source: tuple[list, list] | None = None,
+                      reset_widgets: bool = False,
+                      keep_widgets: tuple[str, ...] = ()) -> None:
     """Replace session data, preserving the version when ``version`` is None.
 
-    ``source_df`` bypasses source loading for rollback. Pass ``project_id``
-    when switching projects; otherwise source loading uses the active project.
+    Pass ``project_id`` when switching projects; otherwise source loading uses
+    the active project.
+    ``keep_widgets`` names session keys that survive ``reset_widgets``.
     """
     data = migrate(data)
+    previous = st.session_state.get(_KEY, {})
+    pid = project_id if project_id is not None else active_id()
+    source_pending = previous.get(_SOURCE_KEY, False)
     inline_records = data.get("original_records") or []
-    if source_df is not None:
-        df = source_df
-    elif inline_records:
+    if inline_records:
         # Move legacy inline spreadsheets to their own row on the next save.
         df = pd.DataFrame(inline_records, columns=data.get("original_columns") or None)
-        st.session_state[_SOURCE_KEY] = True
+        source_pending = True
     elif source is not None:
         columns, records = source
         df = pd.DataFrame(records, columns=columns or None)
-        st.session_state[_SOURCE_KEY] = False
+        source_pending = False
     else:
         columns, records = [], []
-        pid = project_id if project_id is not None else active_id()
         if pid:
             # Propagate read failures to avoid silently exporting empty columns.
             columns, records = db.load_project_source(auth.current_user(), pid)
         df = pd.DataFrame(records, columns=columns or None)
-        st.session_state[_SOURCE_KEY] = False
-    st.session_state[_KEY] = {
+        source_pending = False
+    replacement = {
+        _PROJECT_ID_KEY: pid,
         "mode": data["mode"],
         "config": data["config"],
         "papers": data["papers"],
         "original_df": df,
         "cursors": data["cursors"],
         "pending_pdf_deletions": data.get("pending_pdf_deletions", []),
+        _VERSION_KEY: _as_version(version) if version is not None else previous.get(_VERSION_KEY, 0),
+        _SOURCE_KEY: source_pending,
+        _CONFLICT_KEY: None if version is not None else previous.get(_CONFLICT_KEY),
+        _UNSAVED_KEY: False if version is not None else previous.get(_UNSAVED_KEY, False),
+        _RUNS_MIGRATED_KEY: bool(data.get(_RUNS_MIGRATED_KEY)),
     }
-    if version is not None:
-        st.session_state[_VERSION_KEY] = _as_version(version)
-        st.session_state.pop(_CONFLICT_KEY, None)
+    if reset_widgets:
+        # Finish interruptible cleanup before publishing the loaded document.
+        prefixes = (f"extraction:{pid}:", f"abstract_prompt_{pid}", f"fulltext_prompt_{pid}",
+                    f"jump_abstract_{pid}", f"jump_fulltext_{pid}", "abstract:", "fulltext:",
+                    f"runs:index:{pid}")
+        for key in list(st.session_state):
+            if str(key).startswith(prefixes) and key not in keep_widgets:
+                del st.session_state[key]
+    st.session_state[_KEY] = replacement
 
 
-def reload_project(pid: str) -> None:
+def reload_project(pid: str, *, keep_setup_draft: bool = False) -> None:
     """Read review work and its spreadsheet from one database snapshot."""
     data, version, source = db.load_project_bundle(auth.current_user(), pid)
     if not version:
         raise db.DatabaseError("Project no longer exists or is not accessible.")
-    load_into_session(data, version, project_id=pid, source=source)
     # A discarded form must not autosave its old widget values into the reload.
-    prefixes = (f"extraction:{pid}:", f"abstract_prompt_{pid}", f"fulltext_prompt_{pid}",
-                f"jump_abstract_{pid}", f"jump_fulltext_{pid}", "abstract:", "fulltext:")
-    for key in list(st.session_state):
-        if str(key).startswith(prefixes):
-            del st.session_state[key]
+    keep = (f"extraction:{pid}:setup_draft",) if keep_setup_draft else ()
+    load_into_session(data, version, project_id=pid, source=source, reset_widgets=True,
+                      keep_widgets=keep)
 
 
 def clear_session() -> None:
@@ -613,17 +633,32 @@ def clear_session() -> None:
 def _store() -> dict:
     if _KEY not in st.session_state:
         load_into_session({})
-    return st.session_state[_KEY]
+    store = st.session_state[_KEY]
+    if _PROJECT_ID_KEY not in store:
+        pid = active_id()
+        if pid is not None:
+            store[_PROJECT_ID_KEY] = pid
+    if _VERSION_KEY not in store:
+        # Adopt bookkeeping still held in top-level session keys.
+        store.update({key: st.session_state.get(key, default) for key, default in (
+            (_VERSION_KEY, 0), (_SOURCE_KEY, False), (_CONFLICT_KEY, None),
+        )})
+    return store
 
 
 def loaded() -> bool:
-    return _KEY in st.session_state
+    store = st.session_state.get(_KEY)
+    pid = active_id()
+    return store is not None and store.get(_PROJECT_ID_KEY, pid) == pid
 
 
 def snapshot() -> dict:
     """Return project data without the separately stored imported spreadsheet."""
-    store = _store()
-    return {
+    return _snapshot(_store())
+
+
+def _snapshot(store: dict) -> dict:
+    data = {
         "schema_version": SCHEMA_VERSION,
         "mode": store["mode"],
         "config": store["config"],
@@ -631,108 +666,189 @@ def snapshot() -> dict:
         "cursors": store["cursors"],
         "pending_pdf_deletions": store.get("pending_pdf_deletions", []),
     }
+    if store.get(_RUNS_MIGRATED_KEY):
+        data[_RUNS_MIGRATED_KEY] = True
+    return data
 
 
-def _pending_source() -> tuple[list, list] | None:
+def _paper_uids(data: dict) -> set[str]:
+    return {paper["uid"] for paper in data.get("papers") or []}
+
+
+def _pending_source(store: dict | None = None) -> tuple[list, list] | None:
     """Return unsaved source data for the same transaction as the project."""
-    if not st.session_state.get(_SOURCE_KEY):
+    store = _store() if store is None else store
+    if not store.get(_SOURCE_KEY):
         return None
-    df: pd.DataFrame = _store()["original_df"]
+    df: pd.DataFrame = store["original_df"]
     records = json.loads(df.to_json(orient="records")) if len(df.columns) else []
     return list(df.columns), records
 
 
+class PreparedSave:
+    """Capture session references before I/O; commit without Streamlit yield points."""
+
+    def __init__(self, user_email: str, pid: str, store: dict):
+        self.user_email, self.pid, self.store = user_email, pid, store
+        self.version = _as_version(store.get(_VERSION_KEY))
+        self.data = deepcopy(_snapshot(store))
+        self.source = _pending_source(store)
+
+    def commit(self, data: dict, *, source: tuple[list, list] | None = None,
+               fulltext: dict | None = None, remove_fulltexts: bool = False,
+               remove_fulltext_uids: list[str] | None = None) -> int:
+        source = self.source if source is None else source
+        migrated = bool(self.store.get(_RUNS_MIGRATED_KEY))
+        # The first save imports earlier AI snapshots; later saves skip that scan.
+        data = {**data, _RUNS_MIGRATED_KEY: True}
+        replacement = {**self.store, **data}
+        if source is not None:
+            replacement["original_df"] = pd.DataFrame(source[1], columns=source[0] or None)
+        options = {}
+        if fulltext is not None:
+            options["fulltext"] = fulltext
+        if remove_fulltexts:
+            options["remove_fulltexts"] = True
+        if remove_fulltext_uids:
+            options["remove_fulltext_uids"] = remove_fulltext_uids
+        if migrated:
+            options["import_legacy_runs"] = False
+            removed = sorted(_paper_uids(self.data) - _paper_uids(data))
+            if removed:
+                options["removed_paper_uids"] = removed
+        version = db.save_project(self.user_email, self.pid, data,
+                                  expected_version=self.version or None, source=source, **options)
+        # No session/UI access may interrupt version acknowledgement after commit.
+        replacement.update({_VERSION_KEY: _as_version(version), _SOURCE_KEY: False,
+                            _CONFLICT_KEY: None, _UNSAVED_KEY: False})
+        self.store.clear()
+        self.store.update(replacement)
+        self.version, self.source, self.data = _as_version(version), None, data
+        return self.version
+
+
+def prepare_save() -> PreparedSave:
+    pid, user_email, store = active_id(), auth.current_user(), _store()
+    if not pid:
+        raise db.DatabaseError("No project is open.")
+    if store.get(_PROJECT_ID_KEY) != pid:
+        raise db.DatabaseError(
+            "The project switch was interrupted. Open the project again from My Projects "
+            "before saving; no changes were saved."
+        )
+    return PreparedSave(user_email, pid, store)
+
+
 def save_active(*, fulltext: dict | None = None) -> bool:
     """Save this version, optionally updating PDF metadata in the same transaction."""
-    pid = active_id()
-    if not pid:
+    if not active_id():
         return True
-    user_email = auth.current_user()
-    source = _pending_source()
-    expected = project_version() or None
-    options = {"fulltext": fulltext} if fulltext is not None else {}
     try:
-        version = db.save_project(user_email, pid, snapshot(),
-                                  expected_version=expected, source=source, **options)
+        prepared = prepare_save()
+    except db.DatabaseError as exc:
+        st.error(str(exc))
+        return False
+    try:
+        prepared.commit(_snapshot(prepared.store), fulltext=fulltext)
     except db.ProjectConflictError as exc:
-        st.session_state[_CONFLICT_KEY] = str(exc)
+        prepared.store[_CONFLICT_KEY] = str(exc)
         st.error(str(exc))
         return False
     except db.DatabaseError as exc:
         st.error(str(exc))
         return False
-    st.session_state[_VERSION_KEY] = _as_version(version)
-    st.session_state.pop(_CONFLICT_KEY, None)
-    if source is not None:
-        st.session_state[_SOURCE_KEY] = False
     return True
 
 
 def commit(change) -> None:
-    """Attempt to save an edit, rolling back handled save failures."""
-    before, before_df = deepcopy(snapshot()), _store()["original_df"]
-    source_pending = st.session_state.get(_SOURCE_KEY, False)
+    """Restore interrupted edits unless their database transaction already committed."""
+    store = _store()
+    before = deepcopy(store)
+
+    def rollback():
+        if store.get(_VERSION_KEY) != before.get(_VERSION_KEY):
+            return
+        conflict = store.get(_CONFLICT_KEY)
+        store.clear()
+        store.update(before)
+        store[_CONFLICT_KEY] = conflict
+
     try:
         change()
         saved = save_active()
     except ValueError as exc:
-        load_into_session(before, source_df=before_df)
-        st.session_state[_SOURCE_KEY] = source_pending
+        rollback()
         st.error(str(exc))
         st.stop()
         return
-    except Exception:
-        load_into_session(before, source_df=before_df)
-        st.session_state[_SOURCE_KEY] = source_pending
+    except BaseException:
+        rollback()
         raise
     if not saved:
-        load_into_session(before, source_df=before_df)
-        st.session_state[_SOURCE_KEY] = source_pending
+        rollback()
         st.error("Changes were not saved. Your previous saved data is unchanged; try again.")
         st.stop()
 
 
-def unsaved_results_key() -> str:
-    return f"_unsaved_results_{active_id()}"
+def has_unsaved_results() -> bool:
+    """Whether a paid result or a draft exists only in this session."""
+    return bool(st.session_state.get(_KEY, {}).get(_UNSAVED_KEY))
+
+
+def begin_result() -> None:
+    """Arm recovery before paid work or a draft mutation can be interrupted."""
+    _store()[_UNSAVED_KEY] = True
+
+
+def clear_unsaved_results() -> None:
+    _store()[_UNSAVED_KEY] = False
 
 
 def save_result() -> bool:
     """Retain an AI result or human draft when its checkpoint fails."""
     saved = save_active()
-    if not saved:
-        st.session_state[unsaved_results_key()] = True
+    if saved:
+        # Covers a save that had nothing to commit, such as a closed project.
+        st.session_state.get(_KEY, {})[_UNSAVED_KEY] = False
+    else:
+        begin_result()
     return saved
 
 
 def require_saved_results() -> None:
-    if not st.session_state.get(unsaved_results_key()):
+    if st.session_state.get(_KEY, {}).get("pending_ai_completion"):
+        from features.workflow.run_controls import recover_pending
+        recover_pending()
+    if not has_unsaved_results():
         return
-    conflict = st.session_state.get(_CONFLICT_KEY)
-    st.error(
-        "Results or drafts are waiting to be saved. Keep this session open and retry "
-        "saving before continuing." + (f" {conflict}" if conflict else "")
-    )
-    if st.button("Retry saving results", type="primary") and save_active():
-        st.session_state.pop(unsaved_results_key(), None)
+    conflict = _store().get(_CONFLICT_KEY)
+    st.error("Results or drafts are waiting to be saved. " + (
+        "Another session changed this project; download your unsaved work before reloading."
+        if conflict else "Keep this session open and retry saving, or download your work below."
+    ))
+    if st.button("Retry saving results", type="primary", disabled=bool(conflict)) and save_result():
         st.rerun()
     if conflict:
         st.warning("Another session changed this project. This copy cannot overwrite it. "
                    "Download the unsaved work before discarding this session's changes.")
-        recovery = dict(snapshot())
-        frame = _store()["original_df"]
-        recovery.update(original_columns=list(frame.columns),
-                        original_records=json.loads(frame.to_json(orient="records")))
-        st.download_button("Download unsaved work", json.dumps(recovery, ensure_ascii=False),
-                           file_name="unsaved_review.json", mime="application/json", on_click="ignore")
-        discard = st.checkbox("I have backed up my work and want to discard this session's changes.")
-        if st.button("Discard local changes and reload", disabled=not discard):
-            try:
-                reload_project(active_id())
-            except (db.DatabaseError, UnsupportedSchemaError) as exc:
-                st.error(str(exc))
-            else:
-                st.session_state.pop(unsaved_results_key(), None)
-                st.rerun()
+    recovery = dict(snapshot())
+    frame = _store()["original_df"]
+    recovery.update(original_columns=list(frame.columns),
+                    original_records=json.loads(frame.to_json(orient="records")))
+    st.download_button("Download unsaved work", json.dumps(recovery, ensure_ascii=False),
+                       file_name="unsaved_review.json", mime="application/json", on_click="ignore")
+    discard = st.checkbox("I have backed up my work and want to discard this session's changes.")
+    if st.button("Discard local changes and reload", disabled=not discard):
+        try:
+            reload_project(active_id())
+        except (db.DatabaseError, UnsupportedSchemaError) as exc:
+            st.error(str(exc))
+        else:
+            st.rerun()
+    if st.button("Close project without saving", disabled=not discard):
+        clear_session()
+        set_active(None, None)
+        st.rerun()
     st.stop()
 
 
@@ -756,42 +872,8 @@ def has_papers() -> bool:
     return bool(papers())
 
 
-def replace_papers(rows: list[dict], original_df: pd.DataFrame) -> None:
-    store = _store()
-    store["papers"] = rows
-    store["original_df"] = original_df
-    store["cursors"] = {}
-    st.session_state[_SOURCE_KEY] = True
-
-
-def append_papers(rows: list[dict]) -> None:
-    if not rows:
-        return
-    store = _store()
-    store["papers"].extend(rows)
-    store["cursors"][STAGE_FULLTEXT] = min(
-        int(store["cursors"].get(STAGE_FULLTEXT, 0)),
-        max(len(store["papers"]) - 1, 0),
-    )
-
-
-def remove_paper(paper_uid: str) -> bool:
-    """Remove one paper from project JSON; PDF cleanup is handled by the caller."""
-    store = _store()
-    before = len(store["papers"])
-    store["papers"] = [p for p in store["papers"] if p.get("uid") != paper_uid]
-    store["cursors"][STAGE_FULLTEXT] = 0
-    return len(store["papers"]) != before
-
-
 def pending_pdf_deletions() -> list[dict]:
     return _store().setdefault("pending_pdf_deletions", [])
-
-
-def remove_paper_with_cleanup(paper_uid: str, storage_key: str | None) -> None:
-    """Keep the deletion target durable until both storage and metadata are gone."""
-    if remove_paper(paper_uid):
-        pending_pdf_deletions().append({"paper_uid": paper_uid, "storage_key": storage_key})
 
 
 def current_criteria_hash(stage: str) -> str:
@@ -858,6 +940,9 @@ def _stage_columns(base: pd.DataFrame, papers_list: list[dict], mode_key: str,
     base[f"{prefix}: AI reason"] = [
         cell(i, lambda p, s: s.get("ai_reason") or s.get("ai_error") or "") for i in n
     ]
+    base[f"{prefix}: Source run ID"] = [
+        cell(i, lambda p, s: s.get("source_run_id", "")) for i in n
+    ]
     base[f"{prefix}: Agreed?"] = [
         cell(i, lambda p, s: agreed_text.get(s.get("decision"), "")) for i in n
     ]
@@ -871,6 +956,28 @@ def _stage_columns(base: pd.DataFrame, papers_list: list[dict], mode_key: str,
         else cell(i, lambda p, s: display_label(p, stage, chash))
         for i in n
     ]
+
+
+def decision_history_dataframe() -> pd.DataFrame:
+    """Every archived screening outcome with its decision, oldest first per paper."""
+    columns = ["Paper", "Title", "DOI", "Stage", "Archived at", "AI verdict", "AI reason or error",
+               "Decision", "Human verdict", "Provider", "Model", "Criteria hash", "Source run ID"]
+    rows = []
+    for number, paper in enumerate(papers(), start=1):
+        for stage in (STAGE_ABSTRACT, STAGE_FULLTEXT):
+            for entry in (paper.get("stages") or {}).get(stage, {}).get("history", []):
+                rows.append({
+                    "Paper": number, "Title": paper.get("title", ""), "DOI": paper.get("doi", ""),
+                    "Stage": STAGE_TITLES[stage], "Archived at": entry.get("archived_at") or "",
+                    "AI verdict": VERDICT_LABELS.get(entry.get("ai_verdict"), ""),
+                    "AI reason or error": entry.get("ai_reason") or entry.get("ai_error") or "",
+                    "Decision": entry.get("decision") or "",
+                    "Human verdict": VERDICT_LABELS.get(entry.get("human_verdict"), ""),
+                    "Provider": entry.get("provider") or "", "Model": entry.get("model") or "",
+                    "Criteria hash": entry.get("criteria_hash") or entry.get("review_criteria_hash") or "",
+                    "Source run ID": entry.get("source_run_id") or "",
+                })
+    return pd.DataFrame(rows, columns=columns)
 
 
 def results_dataframe() -> pd.DataFrame:

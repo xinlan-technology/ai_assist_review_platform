@@ -13,7 +13,7 @@ ui.pending_file_cleanup()
 
 
 def _stop_on_db_error(exc: db.DatabaseError) -> None:
-    st.error(str(exc))
+    st.error(ui.escape_markdown(exc))
     st.stop()
 
 with st.container(border=True):
@@ -66,18 +66,21 @@ with st.container(border=True):
         is_active = pid == state.active_id()
 
         info_col, open_col, ren_col, del_col = st.columns([6, 2, 2, 2])
-        info_col.markdown(f"**{name}**" + ("  ·  *open*" if is_active else ""))
+        info_col.markdown(f"**{ui.escape_markdown(name)}**" + ("  ·  *open*" if is_active else ""))
         info_col.caption(f"updated {str(row['updated_at'])[:16].replace('T', ' ')}")
 
         if open_col.button("Open", key=f"open_{pid}", width="stretch"):
             try:
-                # Activate only after loading succeeds.
-                state.reload_project(pid)
+                if not is_active or not state.loaded():
+                    state.reload_project(pid)
+                elif db.project_version(user, pid) != state.project_version():
+                    # Another session saved newer data; the unsaved question setup is kept.
+                    state.reload_project(pid, keep_setup_draft=True)
                 state.set_active(pid, name)
             except db.DatabaseError as exc:
                 _stop_on_db_error(exc)
             except state.UnsupportedSchemaError as exc:
-                st.error(str(exc))
+                st.error(ui.escape_markdown(exc))
                 st.stop()
             st.session_state["_go_workflow"] = True
             st.rerun()
@@ -99,20 +102,15 @@ with st.container(border=True):
                 st.rerun()
 
         if st.session_state.get(f"confirm_del_{pid}"):
-            st.warning(f"Delete “{name}”? This permanently removes its saved work.")
+            st.warning(f"Delete “{ui.escape_markdown(name)}”? This permanently removes its saved work.")
             yes_col, no_col, _ = st.columns([2, 2, 6])
             if yes_col.button("Yes, delete", key=f"yesdel_{pid}", type="primary"):
                 try:
-                    attached = db.load_fulltexts(user, pid)
-                    saved_data, _ = db.load_project_versioned(user, pid)
-                    cleanup_keys = [entry.get("storage_key") for entry in saved_data.get("pending_pdf_deletions", [])]
-                    db.delete_project(user, pid)
+                    cleanup_keys = db.delete_project(user, pid)
                 except db.DatabaseError as exc:
                     _stop_on_db_error(exc)
                 try:
-                    fulltext_storage.delete_many(
-                        [m.get("storage_key") for m in attached.values() if m.get("storage_key")] + cleanup_keys
-                    )
+                    fulltext_storage.delete_many(cleanup_keys)
                 except fulltext_storage.FulltextStorageError as exc:
                     st.session_state.setdefault("_uncommitted_pdf_cleanup", []).extend(exc.failed_keys)
                 if is_active:

@@ -8,7 +8,7 @@ import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 
-from core import auth, csv_io, db
+from core import auth, csv_io, db, ui
 from features.extraction import state as extraction
 from features.extraction.schema import build_spec
 from features.workflow import state as workflow
@@ -43,6 +43,13 @@ def render_summary(monkeypatch, scenario="confirmed", mode=workflow.MODE_PRISMA)
         config["extraction_instructions"] = "Extract the comparison ecosystem instead"
     elif scenario == "ineligible":
         config["abstract_criteria"] = "Updated abstract eligibility criteria"
+    elif scenario == "human_screening_outdated":
+        paper["stages"][workflow.STAGE_FULLTEXT] = {}
+        workflow.set_human_verdict(
+            paper, workflow.STAGE_FULLTEXT, "include",
+            review_hash=workflow.criteria_hash(config["fulltext_criteria"]),
+        )
+        config["fulltext_criteria"] = "Updated full-text eligibility criteria"
     metadata = {paper["uid"]: {"sha256": "pdf-digest", "page_count": 3}}
     monkeypatch.setattr(auth, "sidebar_user", lambda: None)
     monkeypatch.setattr(auth, "current_user", lambda: "test@example.invalid")
@@ -132,3 +139,27 @@ def test_summary_keeps_ineligible_records_in_audit_only(monkeypatch):
     assert "Forest" in audit.loc[0, "Recorded final"]
     assert audit.loc[0, "Current final"] == ""
     assert len(app.download_button) == 3
+
+
+def test_summary_project_name_and_read_errors_are_literal(monkeypatch):
+    app, _ = render_summary(monkeypatch)
+    name = "![project](https://example.invalid/project)"
+    message = "![error](https://example.invalid/error)"
+    app.session_state["active_project_name"] = name
+
+    def unavailable(*args):
+        raise db.DatabaseError(message)
+
+    monkeypatch.setattr(db, "load_fulltexts", unavailable)
+    app.run()
+
+    assert not app.exception
+    assert any(ui.escape_markdown(name) in item.value for item in app.caption)
+    assert any(item.value == ui.escape_markdown(message) for item in app.error)
+
+
+def test_summary_explains_outdated_human_screening_without_requiring_ai(monkeypatch):
+    app, _ = render_summary(monkeypatch, "human_screening_outdated")
+    assert any("1 review(s) are outdated" in item.value and "archive" in item.value
+               for item in app.caption)
+    assert extraction_metrics(app)["Eligible"] == "0"

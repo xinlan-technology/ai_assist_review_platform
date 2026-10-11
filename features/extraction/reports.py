@@ -52,7 +52,7 @@ def audit_dataframe(papers, eligible_uids, spec, metadata):
     columns = ["Paper UID", "Title", "DOI", "Version status", "Question ID", "Question",
                "Type", "Options", "Question guidance", "AI answer", "Recorded final", "Current final", "Decision",
                "AI page", "AI quote", "Final page", "Final quote", "Field error", "Review error", "AI error",
-               "Provider", "Model", "Prompt version", "Spec hash", "PDF SHA256", "Instructions",
+               "Source run ID", "Provider", "Model", "Prompt version", "Spec hash", "PDF SHA256", "Instructions",
                "AI completed at", "Draft saved at", "Reviewed at", "Archived at"]
     rows = []
     for paper in papers:
@@ -66,8 +66,11 @@ def audit_dataframe(papers, eligible_uids, spec, metadata):
             snapshot = record.get("spec", spec)
             for q in snapshot["questions"]:
                 qid = q["id"]
-                ai = record.get("ai_answers", {}).get(qid, {})
-                raw = record.get("invalid_answers", {}).get(qid)
+                ai = record.get("source_answers", {}).get(qid, record.get("ai_answers", {}).get(qid, {}))
+                source_id = record.get("source_run_ids", {}).get(qid, record.get("source_run_id", ""))
+                source = record.get("source_metadata", {}).get(qid, {})
+                baseline = not source_id or source_id == record.get("source_run_id")
+                raw = record.get("invalid_answers", {}).get(qid) if baseline else None
                 human = record.get("final_answers", {}).get(qid, {})
                 human = human if isinstance(human, dict) else {}
                 rows.append({
@@ -81,12 +84,15 @@ def audit_dataframe(papers, eligible_uids, spec, metadata):
                     "Decision": record.get("decisions", {}).get(qid, ""),
                     "AI page": ai.get("page"), "AI quote": ai.get("quote", ""),
                     "Final page": human.get("page"), "Final quote": human.get("quote", ""),
-                    "Field error": record.get("field_errors", {}).get(qid, ""),
+                    "Field error": record.get("field_errors", {}).get(qid, "") if baseline else "",
                     "Review error": record.get("review_errors", {}).get(qid, ""),
-                    "AI error": record.get("ai_error", ""), "Provider": record.get("provider", ""),
-                    "Model": record.get("model", ""), "Prompt version": record.get("prompt_version", ""),
+                    "AI error": record.get("ai_error", "") if baseline else "", "Source run ID": source_id,
+                    "Provider": source.get("provider", record.get("provider", "") if baseline else ""),
+                    "Model": source.get("model", record.get("model", "") if baseline else ""),
+                    "Prompt version": record.get("prompt_version", ""),
                     "Spec hash": record.get("spec_hash", ""), "PDF SHA256": record.get("source_sha256", ""),
-                    "Instructions": snapshot["instructions"], "AI completed at": record.get("completed_at", ""),
+                    "Instructions": snapshot["instructions"],
+                    "AI completed at": source.get("completed_at", record.get("completed_at", "") if baseline else ""),
                     "Draft saved at": record.get("draft_saved_at", ""),
                     "Reviewed at": record.get("reviewed_at", ""), "Archived at": record.get("archived_at", ""),
                 })

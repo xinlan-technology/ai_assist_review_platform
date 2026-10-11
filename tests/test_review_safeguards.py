@@ -41,8 +41,8 @@ def test_archive_never_drops_the_last_confirmed_extraction():
         extraction.archive(paper)
 
     history = extraction.get(paper)["history"]
-    assert len(history) == 5
-    assert any(entry.get("review_state") == "confirmed" for entry in history)
+    assert len(history) == 7
+    assert history[0].get("review_state") == "confirmed"
 
 
 @pytest.fixture
@@ -112,6 +112,7 @@ def test_a_row_without_a_version_can_still_be_saved(monkeypatch):
             """
         ))
     db._upgrade_projects_schema(engine)
+    db._metadata.create_all(engine)
     with engine.begin() as conn:
         conn.execute(text(
             "INSERT INTO projects (id, user_email, name, data, created_at, updated_at) "
@@ -127,3 +128,23 @@ def test_a_row_without_a_version_can_still_be_saved(monkeypatch):
     with pytest.raises(db.ProjectConflictError):
         db.save_project("r@example.com", "p1", {"papers": ["stale"]}, expected_version=1)
     assert db.load_project("r@example.com", "p1") == {"papers": ["kept"]}
+
+
+def test_decision_history_export_lists_every_archived_screening_outcome(monkeypatch):
+    paper = state.new_paper("10.1000/abc", "Study", "Abstract")
+    for round_number, verdict in enumerate(["include", "exclude", "include"]):
+        state.set_ai_result(paper, state.STAGE_ABSTRACT, verdict, f"Reason {round_number}",
+                            "OpenAI", "gpt-4.1", f"hash-{round_number}", "v1")
+        state.stage_state(paper, state.STAGE_ABSTRACT)["source_run_id"] = f"run-{round_number}"
+        state.record_agree(paper, state.STAGE_ABSTRACT)
+        state.archive_ai_result(paper, state.STAGE_ABSTRACT)
+    untouched = state.new_paper("", "Never archived", "")
+    monkeypatch.setattr(state, "papers", lambda: [paper, untouched])
+
+    history = state.decision_history_dataframe()
+
+    assert list(history["AI reason or error"]) == ["Reason 0", "Reason 1", "Reason 2"]
+    assert list(history["AI verdict"]) == ["Include", "Exclude", "Include"]
+    assert set(history["Decision"]) == {state.DECISION_AGREE}
+    assert list(history["Source run ID"]) == ["run-0", "run-1", "run-2"]
+    assert set(history["Paper"]) == {1} and set(history["Stage"]) == {state.STAGE_TITLES[state.STAGE_ABSTRACT]}

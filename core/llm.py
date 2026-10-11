@@ -49,7 +49,10 @@ class InvalidModelResponse(ValueError):
 
 def error_message(error: Exception, api_key: str) -> str:
     message = str(error)
-    return (message.replace(api_key, "[redacted]") if api_key else message)[:4000]
+    for key in sorted({api_key, api_key.strip()}, key=len, reverse=True):
+        if key.strip():
+            message = message.replace(key, "[redacted]")
+    return message[:4000]
 
 
 def _unique_json_object(pairs: list[tuple]) -> dict:
@@ -63,6 +66,25 @@ def _unique_json_object(pairs: list[tuple]) -> dict:
 
 def _invalid_json_constant(value: str):
     raise InvalidModelResponse(f"The model returned a non-JSON value: {value}")
+
+
+def _has_json_container(text: str, decoder: json.JSONDecoder) -> bool:
+    """Find another JSON object/array in prose, ignoring quoted brace examples."""
+    quoted = escaped = False
+    for index, char in enumerate(text):
+        if escaped:
+            escaped = False
+        elif quoted and char == "\\":
+            escaped = True
+        elif char == '"':
+            quoted = not quoted
+        elif not quoted and char in "{[":
+            try:
+                decoder.raw_decode(text, index)
+            except json.JSONDecodeError:
+                continue
+            return True
+    return False
 
 
 def _extract_json(text: str) -> dict:
@@ -98,7 +120,7 @@ def _extract_json(text: str) -> dict:
             pass
         else:
             if isinstance(parsed, dict):
-                if cleaned[start + end:].lstrip().startswith(("{", "[")):
+                if _has_json_container(cleaned[start + end:], decoder):
                     raise InvalidModelResponse("The model returned multiple JSON values")
                 return parsed
     raise InvalidModelResponse("The model's response is not a JSON object")
@@ -140,7 +162,7 @@ def _google_result(response, limit: int | None = None) -> dict:
 def _call_openai(model: str, api_key: str, system: str, user: str) -> dict:
     from openai import OpenAI
 
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=api_key, max_retries=0)
     resp = client.chat.completions.create(
         model=model,
         messages=[
@@ -161,7 +183,7 @@ def _call_openai(model: str, api_key: str, system: str, user: str) -> dict:
 def _call_anthropic(model: str, api_key: str, system: str, user: str) -> dict:
     import anthropic
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = anthropic.Anthropic(api_key=api_key, max_retries=0)
     resp = client.messages.create(
         model=model,
         max_tokens=1024,
@@ -205,10 +227,9 @@ def _call_openai_pdf(
     schema_name: str = "fulltext_screening_result",
     max_output_tokens: int = 512,
 ) -> dict:
-    """Send the original PDF through the multimodal Responses API."""
     from openai import OpenAI
 
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=api_key, max_retries=0)
     resp = client.responses.create(
         model=model,
         max_output_tokens=max_output_tokens,
@@ -258,7 +279,7 @@ def _call_anthropic_pdf(
 ) -> dict:
     import anthropic
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = anthropic.Anthropic(api_key=api_key, max_retries=0)
     resp = client.messages.create(
         model=model,
         max_tokens=max_output_tokens,
@@ -339,7 +360,7 @@ _PDF_DISPATCH = {
 def call_structured(provider: str, model: str, api_key: str, system: str, user: str) -> dict:
     if provider not in _DISPATCH:
         raise ValueError(f"Unknown provider: {provider}")
-    return _DISPATCH[provider](model, api_key, system, user)
+    return _DISPATCH[provider](model, api_key.strip(), system, user)
 
 
 def call_pdf_structured(
@@ -355,7 +376,6 @@ def call_pdf_structured(
     schema_name: str = "fulltext_screening_result",
     max_output_tokens: int = 512,
 ) -> dict:
-    """Call a provider with the original PDF and return one JSON object."""
     if provider not in _PDF_DISPATCH:
         raise ValueError(f"Unknown provider: {provider}")
     if not isinstance(pdf_bytes, (bytes, bytearray)) or not pdf_bytes:
@@ -372,7 +392,7 @@ def call_pdf_structured(
     if max_output_tokens != 512:
         options["max_output_tokens"] = max_output_tokens
     return _PDF_DISPATCH[provider](
-        model, api_key, system, user, bytes(pdf_bytes), filename, **options
+        model, api_key.strip(), system, user, bytes(pdf_bytes), filename, **options
     )
 
 

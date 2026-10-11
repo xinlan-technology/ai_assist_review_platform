@@ -7,10 +7,13 @@ import pandas as pd
 import pytest
 import streamlit as st
 from streamlit.testing.v1 import AppTest
+from streamlit.runtime.scriptrunner import get_script_run_ctx
+from streamlit.runtime.scriptrunner_utils.script_requests import RerunData
 
 from core import auth, db, fulltext_storage
 from features.screening import judge, prompts
 from features.workflow import state
+from run_fixtures import install_run_store
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +52,7 @@ def run_button(app, stage):
 @pytest.fixture
 def screening_ui(monkeypatch):
     st.cache_data.clear()
+    install_run_store(monkeypatch)
     monkeypatch.setattr(auth, "sidebar_user", lambda: None)
     monkeypatch.setattr(auth, "current_user", lambda: "screening@example.invalid")
     monkeypatch.setattr(st, "pdf", lambda *args, **kwargs: st.caption("Offline PDF viewer"))
@@ -91,6 +95,7 @@ def screening_ui(monkeypatch):
         app.session_state["project_store"] = {
             "mode": mode, "config": project["config"], "papers": papers,
             "original_df": pd.DataFrame(), "cursors": {},
+            state._VERSION_KEY: 1,
         }
         return app
 
@@ -148,7 +153,7 @@ def test_failed_initial_checkpoint_prevents_all_model_calls(screening_ui, stage)
     run_button(app, stage).click().run()
     assert not app.exception
     assert store(app)["papers"] == before
-    assert f"_unsaved_results_{PROJECT_ID}" not in app.session_state
+    assert not store(app).get("unsaved_results")
     assert any("Stopping before the run" in error.value for error in app.error)
     model.assert_not_called()
 
@@ -164,27 +169,103 @@ def test_failed_paid_checkpoint_blocks_work_and_retry_only_saves(screening_ui, s
     assert model.call_count == 1
     assert record(app, stage)["ai_verdict"] == "include"
     assert not record(app, stage, 1).get("ai_verdict")
-    unsaved_key = f"_unsaved_results_{PROJECT_ID}"
-    assert app.session_state[unsaved_key] is True
-    assert [button.label for button in app.button] == ["Retry saving results"]
+    assert store(app).get("unsaved_results") is True
+    assert [button.label for button in app.button if not button.disabled] == ["Retry saving results"]
+    assert app.get("download_button")
     assert not app.radio
     assert not app.text_input
 
     save.side_effect = db.DatabaseError("Offline retry failure")
     element(app, "button", "Retry saving results").click().run()
     assert not app.exception
-    assert app.session_state[unsaved_key] is True
+    assert store(app).get("unsaved_results") is True
     assert model.call_count == 1
-    assert [button.label for button in app.button] == ["Retry saving results"]
+    assert [button.label for button in app.button if not button.disabled] == ["Retry saving results"]
 
     save.side_effect = None
     element(app, "button", "Retry saving results").click().run()
     assert not app.exception
-    assert unsaved_key not in app.session_state
+    assert not store(app).get("unsaved_results")
     assert model.call_count == 1
     assert record(app, stage)["ai_verdict"] == "include"
     assert not record(app, stage, 1).get("ai_verdict")
     assert element(app, "button", "✓ Agree")
+
+
+@pytest.mark.parametrize("conflict", [False, True])
+def test_unsaved_work_can_be_backed_up_and_explicitly_discarded(screening_ui, monkeypatch,
+                                                              conflict):
+    create, save, model, _ = screening_ui
+    app = create(state.STAGE_ABSTRACT)
+    store(app)[state._CONFLICT_KEY] = "Another window saved." if conflict else None
+    store(app)["unsaved_results"] = True
+    server_data = state.new_project_data(state.MODE_PRISMA)
+    server_data["config"]["abstract_criteria"] = "Current saved criteria"
+    load = Mock(return_value=(server_data, 7, (["Title"], [{"Title": "Saved study"}])))
+    monkeypatch.setattr(db, "load_project_bundle", load)
+    app.run()
+    assert not app.exception
+    assert app.get("download_button")
+    assert element(app, "button", "Retry saving results").disabled is conflict
+    assert element(app, "button", "Discard local changes and reload").disabled
+    assert element(app, "button", "Close project without saving").disabled
+    save.assert_not_called()
+    element(app, "checkbox", "I have backed up my work and want to discard this session's changes.").check().run()
+    element(app, "button", "Discard local changes and reload").click().run()
+    assert not app.exception
+    assert not store(app).get("unsaved_results")
+    assert store(app)["config"]["abstract_criteria"] == "Current saved criteria"
+    assert store(app)[state._VERSION_KEY] == 7
+    assert store(app)["original_df"].to_dict("records") == [{"Title": "Saved study"}]
+    load.assert_called_once()
+    save.assert_not_called()
+    model.assert_not_called()
+
+
+def test_deleted_project_recovery_can_close_without_saving(screening_ui, monkeypatch):
+    create, save, model, _ = screening_ui
+    app = create(state.STAGE_ABSTRACT)
+    store(app)["unsaved_results"] = True
+    monkeypatch.setattr(db, "load_project_bundle", lambda *args: ({}, 0, ([], [])))
+    app.run()
+    element(app, "checkbox", "I have backed up my work and want to discard this session's changes.").check().run()
+    element(app, "button", "Discard local changes and reload").click().run()
+    assert not app.exception
+    assert any("no longer exists" in error.value for error in app.error)
+    assert store(app).get("unsaved_results")
+    element(app, "button", "Close project without saving").click().run()
+    assert not app.exception
+    assert app.session_state["active_project_id"] is None
+    assert "project_store" not in app.session_state
+    save.assert_not_called()
+    model.assert_not_called()
+
+
+@pytest.mark.parametrize("stage", STAGES)
+def test_rerun_after_model_response_recovers_without_another_model_call(screening_ui, stage):
+    create, save, model, _ = screening_ui
+    app = create(stage).run()
+    element(app, "text_input", "API key").input("offline-openai-key").run()
+
+    def respond_then_rerun(*args):
+        context = get_script_run_ctx()
+        assert context is not None and context.script_requests is not None
+        context.script_requests.request_rerun(RerunData())
+        return {"verdict": "include", "reason": "Relevant study."}
+
+    model.side_effect = respond_then_rerun
+    run_button(app, stage).click().run()
+    assert not app.exception
+    assert store(app).get("unsaved_results")
+    assert record(app, stage)["ai_verdict"] == "include"
+    assert model.call_count == 1
+    assert save.call_count == 1
+    element(app, "button", "Retry saving results").click().run()
+    assert not app.exception
+    assert not store(app).get("unsaved_results")
+    assert record(app, stage)["ai_verdict"] == "include"
+    assert model.call_count == 1
+    assert save.call_count == 2
 
 
 @pytest.mark.parametrize("stage", STAGES)

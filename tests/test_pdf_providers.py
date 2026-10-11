@@ -28,9 +28,9 @@ def test_text_providers_reject_unfinished_json(monkeypatch, provider, reason):
         stop_reason=reason, content=[SimpleNamespace(type="text", text=text)],
         candidates=[SimpleNamespace(finish_reason=reason)], text=text,
     )
-    monkeypatch.setattr(openai, "OpenAI", lambda api_key: SimpleNamespace(
+    monkeypatch.setattr(openai, "OpenAI", lambda api_key, **kwargs: SimpleNamespace(
         chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kwargs: response))))
-    monkeypatch.setattr(anthropic, "Anthropic", lambda api_key: SimpleNamespace(
+    monkeypatch.setattr(anthropic, "Anthropic", lambda api_key, **kwargs: SimpleNamespace(
         messages=SimpleNamespace(create=lambda **kwargs: response)))
     monkeypatch.setattr(genai, "Client", lambda api_key: SimpleNamespace(
         models=SimpleNamespace(generate_content=lambda **kwargs: response)))
@@ -45,7 +45,7 @@ def test_text_providers_reject_unfinished_json(monkeypatch, provider, reason):
 def test_openai_text_rejects_no_choice_or_refusal(monkeypatch, choices):
     import openai
 
-    monkeypatch.setattr(openai, "OpenAI", lambda api_key: SimpleNamespace(
+    monkeypatch.setattr(openai, "OpenAI", lambda api_key, **kwargs: SimpleNamespace(
         chat=SimpleNamespace(completions=SimpleNamespace(
             create=lambda **kwargs: SimpleNamespace(choices=choices)))))
     with pytest.raises(llm.InvalidModelResponse):
@@ -72,7 +72,7 @@ def test_openai_pdf_payload(monkeypatch):
             return SimpleNamespace(output_text='{"verdict":"include","reason":"r"}')
 
     fake_client = SimpleNamespace(responses=Responses())
-    monkeypatch.setattr(openai, "OpenAI", lambda api_key: fake_client)
+    monkeypatch.setattr(openai, "OpenAI", lambda api_key, **kwargs: fake_client)
 
     result = llm._call_openai_pdf("gpt", "key", "system", "prompt", PDF, "paper.pdf")
     assert result["verdict"] == "include"
@@ -98,7 +98,7 @@ def test_anthropic_pdf_payload(monkeypatch):
             return SimpleNamespace(content=[block])
 
     fake_client = SimpleNamespace(messages=Messages())
-    monkeypatch.setattr(anthropic, "Anthropic", lambda api_key: fake_client)
+    monkeypatch.setattr(anthropic, "Anthropic", lambda api_key, **kwargs: fake_client)
 
     result = llm._call_anthropic_pdf("claude", "key", "system", "prompt", PDF, "p.pdf")
     assert result["verdict"] == "exclude"
@@ -151,9 +151,9 @@ def test_pdf_providers_receive_dynamic_schema_and_token_limit(monkeypatch, provi
             candidates=[SimpleNamespace(finish_reason="STOP")],
         )
 
-    monkeypatch.setattr(openai, "OpenAI", lambda api_key: SimpleNamespace(
+    monkeypatch.setattr(openai, "OpenAI", lambda api_key, **kwargs: SimpleNamespace(
         responses=SimpleNamespace(create=fake_response)))
-    monkeypatch.setattr(anthropic, "Anthropic", lambda api_key: SimpleNamespace(
+    monkeypatch.setattr(anthropic, "Anthropic", lambda api_key, **kwargs: SimpleNamespace(
         messages=SimpleNamespace(create=fake_response)))
     monkeypatch.setattr(genai, "Client", lambda api_key: SimpleNamespace(
         models=SimpleNamespace(generate_content=fake_response)))
@@ -191,7 +191,7 @@ def test_anthropic_removes_unsupported_schema_constraints(monkeypatch):
         return SimpleNamespace(stop_reason="end_turn", content=[
             SimpleNamespace(type="text", text='{"answers": {}}')])
 
-    monkeypatch.setattr(anthropic, "Anthropic", lambda api_key: SimpleNamespace(
+    monkeypatch.setattr(anthropic, "Anthropic", lambda api_key, **kwargs: SimpleNamespace(
         messages=SimpleNamespace(create=fake)))
     spec = build_spec("", [{
         "id": "q1", "text": "Ecosystem?", "type": "single_choice", "options": ["Forest"],
@@ -210,7 +210,7 @@ def test_openai_rejects_unfinished_valid_json(monkeypatch, status):
     import openai
 
     response = SimpleNamespace(status=status, output_text='{"answers": {}}')
-    monkeypatch.setattr(openai, "OpenAI", lambda api_key: SimpleNamespace(
+    monkeypatch.setattr(openai, "OpenAI", lambda api_key, **kwargs: SimpleNamespace(
         responses=SimpleNamespace(create=lambda **kwargs: response)))
     with pytest.raises(llm.InvalidModelResponse):
         llm._call_openai_pdf("m", "k", "s", "u", PDF, "p.pdf")
@@ -223,7 +223,7 @@ def test_openai_rejects_refusal_even_with_json(monkeypatch):
         status="completed", output_text='{"answers": {}}',
         output=[SimpleNamespace(content=[SimpleNamespace(type="refusal")])],
     )
-    monkeypatch.setattr(openai, "OpenAI", lambda api_key: SimpleNamespace(
+    monkeypatch.setattr(openai, "OpenAI", lambda api_key, **kwargs: SimpleNamespace(
         responses=SimpleNamespace(create=lambda **kwargs: response)))
     with pytest.raises(llm.InvalidModelResponse):
         llm._call_openai_pdf("m", "k", "s", "u", PDF, "p.pdf")
@@ -237,7 +237,7 @@ def test_anthropic_rejects_partial_or_refused_json(monkeypatch, reason):
         stop_reason=reason,
         content=[SimpleNamespace(type="text", text='{"answers": {}}')],
     )
-    monkeypatch.setattr(anthropic, "Anthropic", lambda api_key: SimpleNamespace(
+    monkeypatch.setattr(anthropic, "Anthropic", lambda api_key, **kwargs: SimpleNamespace(
         messages=SimpleNamespace(create=lambda **kwargs: response)))
     with pytest.raises(llm.InvalidModelResponse):
         llm._call_anthropic_pdf("m", "k", "s", "u", PDF, "p.pdf")

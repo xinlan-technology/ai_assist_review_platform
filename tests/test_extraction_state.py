@@ -26,6 +26,19 @@ def run(paper, result=None):
     state.set_ai_result(paper, SPEC, SOURCE, {"answers": result if result is not None else answers()}, "Provider", "Model", 5)
 
 
+def test_form_revision_advances_once_per_result_error_and_archive_but_not_draft():
+    paper = {}
+    assert state.form_nonce(state.get(paper)) == 0
+    run(paper)
+    assert state.form_nonce(state.get(paper)) == 1
+    state.save_review(paper, SPEC, SOURCE, answers(), page_count=5)
+    assert state.form_nonce(state.get(paper)) == 1
+    state.set_error(paper, SPEC, SOURCE, "Unavailable", "call_failed")
+    assert state.form_nonce(state.get(paper)) == 2
+    state.archive(paper)
+    assert state.form_nonce(state.get(paper)) == 3
+
+
 def test_ai_then_review_uses_actual_answers_and_multiselect_order():
     paper = {}
     assert state.pending(paper, SPEC, SOURCE)
@@ -112,7 +125,7 @@ def test_errors_retry_only_transient_failures_and_allow_human_review():
     assert not state.pending(paper, SPEC, SOURCE)
 
 
-def test_archive_releases_stale_state_and_keeps_complete_bounded_history():
+def test_archive_releases_stale_state_and_keeps_every_earlier_version():
     paper = {}
     for _ in range(7):
         run(paper)
@@ -120,7 +133,7 @@ def test_archive_releases_stale_state_and_keeps_complete_bounded_history():
     state.archive(paper)
     record = state.get(paper)
     assert set(record) - {"form_nonce"} == {"history"}
-    assert len(record["history"]) == 5
+    assert len(record["history"]) == 7
     assert record["history"][-1]["spec"] == SPEC
     assert record["history"][-1]["review_state"] == "confirmed"
     assert "history" not in record["history"][-1]

@@ -35,11 +35,11 @@ def load_functions(filename, bindings, names=None):
     return namespace
 
 
-class Rerun(Exception):
+class Rerun(BaseException):
     pass
 
 
-class Stop(Exception):
+class Stop(BaseException):
     pass
 
 
@@ -106,7 +106,9 @@ class FakeDatabase:
         self.deleted = []
         self.bundle_reads = 0
 
-    def save_project(self, user, pid, data, expected_version=None, source=None, fulltext=None):
+    def save_project(self, user, pid, data, expected_version=None, source=None, fulltext=None,
+                     remove_fulltexts=False, remove_fulltext_uids=None,
+                     import_legacy_runs=True, removed_paper_uids=None):
         if self.failed:
             raise DatabaseError("Unavailable")
         if expected_version != self.version:
@@ -115,6 +117,9 @@ class FakeDatabase:
         self.data = copy.deepcopy(data)
         if source is not None:
             self.source = copy.deepcopy(source)
+        removals = list(self.metadata) if remove_fulltexts else remove_fulltext_uids or []
+        for uid in removals:
+            self.delete_fulltext(user, pid, uid)
         if fulltext is not None:
             self.metadata[fulltext["paper_uid"]] = copy.deepcopy(fulltext)
         self.version += 1
@@ -126,6 +131,12 @@ class FakeDatabase:
 
     def load_project_source(self, *args):
         raise AssertionError("The source must be read in the same bundle as the project.")
+
+    def load_fulltexts(self, user, pid):
+        return copy.deepcopy(self.metadata)
+
+    def fulltext_key_in_use(self, user, key):
+        return any(meta.get("storage_key") == key for meta in self.metadata.values())
 
     def delete_fulltext(self, user, pid, uid):
         self.deleted.append(uid)
@@ -186,8 +197,13 @@ class OfflineSafetyTests(unittest.TestCase):
         self.db.data = copy.deepcopy(self.state.snapshot())
         self.metadata = {"paper1": {"storage_key": "old.pdf", "sha256": "old"}}
         self.db.metadata = copy.deepcopy(self.metadata)
+        documents = load_functions("features/workflow/documents.py", {
+            "db": self.db, "state": self.state, "fulltext_storage": self.storage,
+        })
+        self.documents = SimpleNamespace(**documents)
         self.fulltext = load_functions("views/fulltext_screening.py", {
             "st": self.st, "db": self.db, "state": self.state,
+            "documents": self.documents,
             "fulltext_storage": self.storage, "user": "reviewer@example.test",
             "project_id": "project", "_cached_pdf": SimpleNamespace(clear=Mock()),
         }, {"_attach_prepared", "_cleanup_removed_pdfs"})
@@ -198,11 +214,12 @@ class OfflineSafetyTests(unittest.TestCase):
     def test_failed_autosave_stays_blocked_until_retry_succeeds(self):
         spec = self.schema.build_spec("Use study evidence.", [
             {"id": "q1", "text": "Setting?", "type": "single_choice", "options": ["Forest"]}])
-        page = load_functions("views/extraction.py", {
+        page = load_functions("features/extraction/drafts.py", {
             "st": self.st, "state": self.state, "schema": self.schema, "extraction": self.extraction,
-        }, {"_review_key", "_widget_answers", "_form_shape", "_comparable", "_autosave_open_paper"})
+        }, {"review_key", "_keys", "_widget_answers", "_form_shape", "_comparable",
+            "_provenance", "_current", "autosave"})
         prefix, digest = "extraction:project", "source"
-        key = page["_review_key"](prefix, self.paper, spec, digest)
+        key = page["review_key"](prefix, self.paper, spec, digest)
         self.st.session_state.update({
             f"{prefix}:open_form": {"uid": "paper1", "digest": digest, "review_key": key,
                                     "pages": 2, "editable": True},
@@ -211,7 +228,7 @@ class OfflineSafetyTests(unittest.TestCase):
         })
         self.db.failed = True
         with self.assertRaises(Rerun):
-            page["_autosave_open_paper"](prefix, spec, {})
+            page["autosave"](prefix, spec)
         record = self.extraction.get(self.paper)
         self.assertEqual(record["final_answers"]["q1"]["quote"], "Typed evidence.")
         self.assertEqual(record["checked_questions"], ["q1"])
@@ -219,14 +236,14 @@ class OfflineSafetyTests(unittest.TestCase):
             self.st.clicked = click
             with self.assertRaises(Stop):
                 self.state.require_saved_results()
-            self.assertTrue(self.st.session_state[self.state.unsaved_results_key()])
+            self.assertTrue(self.state.has_unsaved_results())
         self.assertEqual(self.db.writes, [])
         self.db.failed = False
         with self.assertRaises(Rerun):
             self.state.require_saved_results()
-        self.assertNotIn(self.state.unsaved_results_key(), self.st.session_state)
+        self.assertFalse(self.state.has_unsaved_results())
         self.assertEqual(len(self.db.writes), 1)
-        page["_autosave_open_paper"](prefix, spec, {})
+        page["autosave"](prefix, spec)
         self.assertEqual(len(self.db.writes), 1)
 
     def test_conflict_cannot_force_overwrite_and_backup_keeps_matching_csv(self):
@@ -261,7 +278,7 @@ class OfflineSafetyTests(unittest.TestCase):
         self.assertEqual(self.state.papers()[0]["title"], "Replacement study")
         self.assertEqual(self.state._store()["original_df"].records, self.db.source[1])
         self.assertEqual(self.state.project_version(), self.db.version)
-        self.assertNotIn(self.state.unsaved_results_key(), self.st.session_state)
+        self.assertFalse(self.state.has_unsaved_results())
         self.assertNotIn("extraction:project:open_form", self.st.session_state)
         self.assertNotIn("extraction:project:setup_draft", self.st.session_state)
         self.assertEqual(self.st.session_state["llm:api_key:OpenAI"], "synthetic-session-key")
@@ -291,7 +308,7 @@ class OfflineSafetyTests(unittest.TestCase):
         before_metadata = copy.deepcopy(self.metadata)
         self.db.version += 1
         for _ in range(2):
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises(ProjectConflictError):
                 self.attach()
             self.assertEqual(self.paper["stages"], before_stages)
             self.assertEqual(self.metadata, before_metadata)
@@ -302,12 +319,15 @@ class OfflineSafetyTests(unittest.TestCase):
         self.assertNotIn("old.pdf", self.storage.deleted)
         self.assertEqual(self.db.writes, [])
 
-    def test_cleanup_retains_failed_targets_and_only_then_deletes_metadata(self):
-        target = {"paper_uid": "paper1", "storage_key": "old.pdf"}
-        self.state.pending_pdf_deletions().append(target)
+    def test_removal_commits_metadata_before_cleanup_and_retains_failed_targets(self):
+        self.documents.remove(self.state.prepare_save(), "paper1")
+        target = {"paper_uid": None, "storage_key": "old.pdf"}
+        self.assertEqual(self.db.metadata, {})
+        self.assertEqual(self.db.data["papers"], [])
+        self.assertIn("old.pdf", self.storage.files)
         self.storage.failed.add("old.pdf")
         self.assertFalse(self.fulltext["_cleanup_removed_pdfs"]())
-        self.assertEqual(self.db.deleted, [])
+        self.assertEqual(self.db.deleted, ["paper1"])
         self.assertEqual(self.state.pending_pdf_deletions(), [target])
         self.storage.failed.clear()
         self.assertTrue(self.fulltext["_cleanup_removed_pdfs"]())
@@ -316,82 +336,136 @@ class OfflineSafetyTests(unittest.TestCase):
         self.assertEqual(self.db.writes[-1][0]["pending_pdf_deletions"], [])
 
     def test_cleanup_commit_failure_restores_retry_queue(self):
-        target = {"paper_uid": "paper1", "storage_key": "old.pdf"}
-        self.state.pending_pdf_deletions().append(target)
+        self.documents.remove(self.state.prepare_save(), "paper1")
+        target = {"paper_uid": None, "storage_key": "old.pdf"}
         self.db.failed = True
-        with self.assertRaises(Stop):
-            self.fulltext["_cleanup_removed_pdfs"]()
+        self.assertFalse(self.fulltext["_cleanup_removed_pdfs"]())
         self.assertEqual(self.state.pending_pdf_deletions(), [target])
+        self.assertEqual(self.db.data["pending_pdf_deletions"], [target])
+        self.assertNotIn("old.pdf", self.storage.files)
         self.db.failed = False
         self.assertTrue(self.fulltext["_cleanup_removed_pdfs"]())
 
     def test_cleanup_continues_past_failure_and_retains_only_failed_targets(self):
-        failed = {"paper_uid": "paper1", "storage_key": "old.pdf"}
-        completed = {"paper_uid": "paper2", "storage_key": "other.pdf"}
-        self.state.pending_pdf_deletions().extend([failed, completed])
+        self.documents.remove(self.state.prepare_save(), "paper1")
+        failed = {"paper_uid": None, "storage_key": "old.pdf"}
+        completed = {"paper_uid": None, "storage_key": "other.pdf"}
+        self.state.pending_pdf_deletions().append(completed)
+        self.storage.files["other.pdf"] = b"other"
         self.storage.failed.add("old.pdf")
         self.assertFalse(self.fulltext["_cleanup_removed_pdfs"]())
-        self.assertEqual(self.db.deleted, ["paper2"])
+        self.assertEqual(self.db.deleted, ["paper1"])
+        self.assertEqual(self.storage.deleted, ["other.pdf"])
         self.assertEqual(self.state.pending_pdf_deletions(), [failed])
         self.assertEqual(self.db.writes[-1][0]["pending_pdf_deletions"], [failed])
 
-    def test_metadata_cleanup_failure_keeps_target_for_idempotent_retry(self):
+    def test_legacy_metadata_cleanup_failure_does_not_delete_the_file(self):
         target = {"paper_uid": "paper1", "storage_key": "old.pdf"}
+        self.state._store()["papers"] = []
         self.state.pending_pdf_deletions().append(target)
-        with patch.object(self.db, "delete_fulltext", side_effect=DatabaseError("Unavailable")):
-            self.assertFalse(self.fulltext["_cleanup_removed_pdfs"]())
-        self.assertNotIn("old.pdf", self.storage.files)
+        self.assertTrue(self.state.save_active())
+        self.db.failed = True
+        self.assertFalse(self.fulltext["_cleanup_removed_pdfs"]())
+        self.assertIn("old.pdf", self.storage.files)
+        self.assertEqual(self.db.metadata["paper1"]["storage_key"], "old.pdf")
         self.assertEqual(self.state.pending_pdf_deletions(), [target])
+        self.db.failed = False
         self.assertTrue(self.fulltext["_cleanup_removed_pdfs"]())
         self.assertEqual(self.db.deleted, ["paper1"])
 
+    def test_cleanup_never_deletes_a_currently_referenced_file(self):
+        self.state.pending_pdf_deletions().append({"paper_uid": "paper1", "storage_key": "old.pdf"})
+        self.assertTrue(self.fulltext["_cleanup_removed_pdfs"]())
+        self.assertEqual(self.storage.deleted, [])
+        self.assertEqual(self.db.deleted, [])
+        self.assertEqual(self.storage.files, {"old.pdf": b"old"})
+        self.assertEqual(self.db.metadata["paper1"]["storage_key"], "old.pdf")
+        self.assertEqual(self.state.pending_pdf_deletions(), [])
+
     def test_pending_cleanup_survives_saved_snapshot_and_reload(self):
-        self.state.commit(lambda: self.state.remove_paper_with_cleanup("paper1", "old.pdf"))
+        self.documents.remove(self.state.prepare_save(), "paper1")
         saved = copy.deepcopy(self.db.data)
         self.assertEqual(saved["papers"], [])
         self.state.clear_session()
         self.state.reload_project("project")
         self.assertEqual(self.state.snapshot(), saved)
-        self.assertEqual(self.state.pending_pdf_deletions(), [{"paper_uid": "paper1", "storage_key": "old.pdf"}])
+        self.assertEqual(self.state.pending_pdf_deletions(), [{"paper_uid": None, "storage_key": "old.pdf"}])
+        self.assertEqual(self.db.metadata, {})
 
     def test_failed_csv_import_restores_the_source_pending_flag(self):
         before = copy.deepcopy(self.state.snapshot())
         self.db.failed = True
+        def replace_spreadsheet():
+            store = self.state._store()
+            store.update(papers=[], original_df=Frame([{"title": "Replacement"}]), cursors={})
+            store[self.state._SOURCE_KEY] = True
+
         with self.assertRaises(Stop):
-            self.state.commit(lambda: self.state.replace_papers([], Frame([{"title": "Replacement"}])))
+            self.state.commit(replace_spreadsheet)
         self.assertEqual(self.state.snapshot(), before)
-        self.assertFalse(self.st.session_state[self.state._SOURCE_KEY])
+        self.assertFalse(self.state._store()[self.state._SOURCE_KEY])
         self.assertEqual(self.state._store()["original_df"].records, self.db.source[1])
 
     def test_failed_upload_cleanup_retains_its_unique_target(self):
         self.db.version += 1
         self.storage.on_save = self.storage.failed.add
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(ProjectConflictError):
             self.attach()
         self.assertEqual(self.st.session_state["_uncommitted_pdf_cleanup"], self.storage.saved)
         self.assertEqual(self.db.metadata["paper1"]["storage_key"], "old.pdf")
 
+    def test_interrupted_attachment_leaves_saved_and_session_data_unchanged(self):
+        before = copy.deepcopy(self.state.snapshot())
+        with patch.object(self.db, "save_project", side_effect=Stop):
+            with self.assertRaises(Stop):
+                self.attach()
+        self.assertEqual(self.state.snapshot(), before)
+        self.assertEqual(self.db.data, before)
+        self.assertEqual(self.storage.files, {"old.pdf": b"old"})
+        self.assertEqual(self.db.metadata["paper1"]["storage_key"], "old.pdf")
+
+    def test_rerun_after_attachment_keeps_the_committed_file_and_version(self):
+        self.fulltext["_cached_pdf"].clear.side_effect = Rerun
+        with self.assertRaises(Rerun):
+            self.attach()
+        key = self.db.metadata["paper1"]["storage_key"]
+        self.assertNotEqual(key, "old.pdf")
+        self.assertEqual(self.storage.files[key], b"new")
+        self.assertEqual(self.state.project_version(), self.db.version)
+        self.assertEqual(self.state.snapshot(), self.db.data)
+        self.assertEqual(self.state.pending_pdf_deletions(), [{"paper_uid": None, "storage_key": "old.pdf"}])
+
     def test_shared_cleanup_notice_persists_and_retries_only_failed_keys(self):
         self.st.session_state["_uncommitted_pdf_cleanup"] = ["first.pdf", "second.pdf"]
-        failure = StorageError("Unavailable")
-        failure.failed_keys = ["second.pdf"]
-        self.storage.delete_many = Mock(side_effect=[failure, None])
+        calls = []
+
+        def retry(user, keys):
+            calls.append((user, list(keys)))
+            return ["second.pdf"] if len(calls) == 1 else []
+
+        cleanup = Mock(side_effect=retry)
         core = ModuleType("core")
-        core.fulltext_storage = self.storage
+        core.auth = self.auth
+        workflow = ModuleType("features.workflow")
+        workflow.documents = SimpleNamespace(cleanup_keys=cleanup)
         notice = load_functions("core/ui.py", {"st": self.st}, {"pending_file_cleanup"})["pending_file_cleanup"]
-        with patch.dict(sys.modules, {"core": core}):
+        with patch.dict(sys.modules, {"core": core, "features.workflow": workflow}):
             notice()
             notice()
             self.assertEqual(self.st.warning.call_count, 2)
-            self.storage.delete_many.assert_not_called()
+            cleanup.assert_not_called()
             self.st.clicked = "Retry pending file cleanup"
             with self.assertRaises(Rerun):
                 notice()
             self.assertEqual(self.st.session_state["_uncommitted_pdf_cleanup"], ["second.pdf"])
             with self.assertRaises(Rerun):
                 notice()
-        self.storage.delete_many.assert_called_with(["second.pdf"])
-        self.assertNotIn("_uncommitted_pdf_cleanup", self.st.session_state)
+        self.assertEqual(cleanup.call_count, 2)
+        self.assertEqual(calls, [
+            ("reviewer@example.test", ["first.pdf", "second.pdf"]),
+            ("reviewer@example.test", ["second.pdf"]),
+        ])
+        self.assertEqual(self.st.session_state["_uncommitted_pdf_cleanup"], [])
 
 
 if __name__ == "__main__":

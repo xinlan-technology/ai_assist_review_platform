@@ -150,3 +150,30 @@ def test_foreign_writer_cannot_add_a_source_or_pdf(engine):
                         source=(["Title"], [{"Title": "Foreign"}]), fulltext=_attachment())
     assert db.load_project_source("other@example.com", pid) == ([], [])
     assert db.load_fulltexts("other@example.com", pid) == {}
+
+
+@pytest.mark.parametrize("removal", [{"remove_fulltexts": True}, {"remove_fulltext_uids": ["paper-1"]}])
+def test_pdf_removal_is_atomic_with_project_version_and_source(engine, removal):
+    user = "reviewer@example.com"
+    pid = db.create_project(user, "Study", {"papers": ["paper-1"]})
+    db.save_project(user, pid, {"papers": ["paper-1"]}, expected_version=1,
+                    fulltext=_attachment())
+    with pytest.raises(db.ProjectConflictError):
+        db.save_project(user, pid, {"papers": []}, expected_version=1, **removal)
+    assert db.fulltext_key_in_use(user, "pdf/old")
+    source = (["Title"], [{"Title": "Replacement"}])
+    db.save_project(user, pid, {"papers": []}, expected_version=2, source=source, **removal)
+    assert db.load_fulltexts(user, pid) == {}
+    assert not db.fulltext_key_in_use(user, "pdf/old")
+    assert db.load_project_bundle(user, pid) == ({"papers": []}, 3, source)
+
+
+def test_guarded_metadata_delete_does_not_remove_a_replacement(engine):
+    user = "reviewer@example.com"
+    pid = db.create_project(user, "Study", {})
+    db.save_project(user, pid, {}, expected_version=1, fulltext=_attachment("new"))
+    db.delete_fulltext(user, pid, "paper-1", expected_storage_key="pdf/old")
+    assert db.fulltext_key_in_use(user, "pdf/new")
+    assert not db.fulltext_key_in_use("other@example.com", "pdf/new")
+    db.delete_fulltext(user, pid, "paper-1", expected_storage_key="pdf/new")
+    assert not db.fulltext_key_in_use(user, "pdf/new")

@@ -8,9 +8,10 @@ import pytest
 import streamlit as st
 from streamlit.testing.v1 import AppTest
 
-from core import auth, db, fulltext_storage
+from core import auth, db, fulltext_storage, ui as core_ui
 from features.extraction import judge, schema, state as extraction
 from features.workflow import state
+from run_fixtures import install_run_store
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +28,7 @@ def element(app, kind, label):
 @pytest.fixture
 def ui(monkeypatch):
     st.cache_data.clear()
+    install_run_store(monkeypatch)
     monkeypatch.setattr(auth, "sidebar_user", lambda: None)
     monkeypatch.setattr(auth, "current_user", lambda: "test@example.com")
     monkeypatch.setattr(auth, "require_login", lambda: "test@example.com")
@@ -89,7 +91,7 @@ def test_ai_answer_requires_review_then_confirms_without_second_call(ui):
     create, _, model = ui
     app = create().run()
     element(app, "text_input", "API key").input("mock-key").run()
-    element(app, "button", "▶ Run AI extraction (1)").click().run()
+    element(app, "button", "▶ Run AI extraction (1 paper · 1 call)").click().run()
     assert not app.exception
     assert model.call_count == 1
     assert element(app, "button", "Confirm extraction").disabled
@@ -98,7 +100,7 @@ def test_ai_answer_requires_review_then_confirms_without_second_call(ui):
     assert not app.exception
     assert record(app)["review_state"] == "confirmed"
     assert record(app)["decisions"] == {"q1": "accepted"}
-    assert element(app, "button", "▶ Run AI extraction (0)").disabled
+    assert element(app, "button", "▶ Run AI extraction (0 papers · 0 calls)").disabled
     assert model.call_count == 1
 
 
@@ -140,10 +142,11 @@ def test_unsaved_ai_result_blocks_work_and_retry_only_saves(ui):
     app = create().run()
     element(app, "text_input", "API key").input("mock-key").run()
     save.side_effect = [True, False]
-    element(app, "button", "▶ Run AI extraction (1)").click().run()
+    element(app, "button", "▶ Run AI extraction (1 paper · 1 call)").click().run()
     assert not app.exception
-    assert app.session_state["_unsaved_results_test-project"] is True
-    assert len(app.button) == 1
+    assert app.session_state["project_store"].get("unsaved_results") is True
+    assert [button.label for button in app.button if not button.disabled] == ["Retry saving results"]
+    assert len(app.get("download_button")) == 1
     save.side_effect = None
     element(app, "button", "Retry saving results").click().run()
     assert not app.exception
@@ -154,8 +157,10 @@ def test_unsaved_ai_result_blocks_work_and_retry_only_saves(ui):
 def test_failed_review_save_rolls_back_confirmation(ui):
     create, save, _ = ui
     app = create(ai=True).run()
-    before = deepcopy(record(app))
     element(app, "checkbox", "Reviewed this question").check().run()
+    # The ticked review box is itself kept as draft progress.
+    before = deepcopy(record(app))
+    assert before["review_state"] == "draft" and before["checked_questions"] == ["q1"]
     save.return_value = False
     element(app, "button", "Confirm extraction").click().run()
     assert not app.exception
@@ -170,7 +175,7 @@ def test_archiving_draft_explicitly_reenables_ai_without_automatic_call(ui, ai):
     element(app, "button", "Save draft").click().run()
     draft = deepcopy(record(app))
     element(app, "text_input", "API key").input("mock-key").run()
-    assert element(app, "button", "▶ Run AI extraction (0)").disabled
+    assert element(app, "button", "▶ Run AI extraction (0 papers · 0 calls)").disabled
     element(app, "button", "Archive draft and start over").click().run()
     assert not app.exception
     assert set(record(app)) - {"form_nonce"} == {"history"}
@@ -179,9 +184,9 @@ def test_archiving_draft_explicitly_reenables_ai_without_automatic_call(ui, ai):
     assert archived["review_state"] == "draft"
     if ai:
         assert archived["ai_answers"] == draft["ai_answers"]
-    assert not element(app, "button", "▶ Run AI extraction (1)").disabled
+    assert not element(app, "button", "▶ Run AI extraction (1 paper · 1 call)").disabled
     model.assert_not_called()
-    element(app, "button", "▶ Run AI extraction (1)").click().run()
+    element(app, "button", "▶ Run AI extraction (1 paper · 1 call)").click().run()
     assert not app.exception
     assert model.call_count == 1
     assert record(app)["ai_answers"]["q1"] == ANSWER
@@ -203,13 +208,14 @@ def test_failed_draft_archive_save_restores_current_draft(ui):
 def test_app_navigation_is_blocked_until_unsaved_results_persist(ui):
     create, save, _ = ui
     app = create(filename="app.py")
-    app.session_state["_unsaved_results_test-project"] = True
+    app.session_state["project_store"]["unsaved_results"] = True
     save.return_value = False
     app.run()
     assert not app.exception
-    assert [b.label for b in app.button] == ["Retry saving results"]
+    assert [button.label for button in app.button if not button.disabled] == ["Retry saving results"]
+    assert len(app.get("download_button")) == 1
     element(app, "button", "Retry saving results").click().run()
-    assert app.session_state["_unsaved_results_test-project"] is True
+    assert app.session_state["project_store"].get("unsaved_results") is True
 
 
 def test_reordering_preserves_question_ids_and_current_edits(ui):
@@ -252,12 +258,12 @@ def test_invalid_model_answer_is_visible_and_never_auto_retried(ui):
     model.return_value = {"answers": {}}
     app = create().run()
     element(app, "text_input", "API key").input("mock-key").run()
-    element(app, "button", "▶ Run AI extraction (1)").click().run()
+    element(app, "button", "▶ Run AI extraction (1 paper · 1 call)").click().run()
     assert not app.exception
     assert record(app)["field_errors"]
-    assert element(app, "button", "▶ Run AI extraction (0)").disabled
+    assert element(app, "button", "▶ Run AI extraction (0 papers · 0 calls)").disabled
     assert element(app, "selectbox", "Your answer").value is None
-    assert not element(app, "button", "↻ Retry invalid responses (1)").disabled
+    assert not element(app, "button", "↻ Retry invalid responses (1 paper · 1 call, may be billed again)").disabled
     assert model.call_count == 1
 
 
@@ -278,7 +284,7 @@ def test_provider_limit_blocks_ai_but_keeps_manual_review_available(ui, monkeypa
     app = create().run()
     element(app, "text_input", "API key").input("mock-key").run()
     assert not app.exception
-    assert element(app, "button", "▶ Run AI extraction (1)").disabled
+    assert element(app, "button", "▶ Run AI extraction (0 papers · 0 calls)").disabled
     assert not element(app, "button", "Save draft").disabled
     assert not element(app, "selectbox", "Your answer").disabled
     assert any("Reduce options" in warning.value for warning in app.warning)
@@ -294,6 +300,24 @@ def test_unsaved_answers_survive_a_rerun(ui):
     saved = record(app)
     assert saved["review_state"] == "draft"
     assert saved["final_answers"]["q1"]["quote"] == "my own evidence"
+
+
+def test_autosave_validation_failure_restores_data_without_blocking_recovery(ui, monkeypatch):
+    create, save, model = ui
+    app = create(ai=True).run()
+    before = deepcopy(record(app))
+
+    def invalid(paper, *args, **kwargs):
+        extraction.get(paper)["review_state"] = "draft"
+        raise ValueError("Invalid draft")
+
+    monkeypatch.setattr(extraction, "save_review", invalid)
+    element(app, "text_area", "Supporting quote").input("Edited evidence.").run()
+    assert not app.exception
+    assert record(app) == before
+    assert not app.session_state["project_store"].get("unsaved_results")
+    save.assert_not_called()
+    model.assert_not_called()
 
 
 @pytest.mark.parametrize("action", ["next", "run", "setup"])
@@ -320,14 +344,15 @@ def test_failed_autosave_blocks_actions_and_retries_without_model_calls(ui, monk
     save.return_value = False
     calls_before = save.call_count
     element(app, "text_area", "Supporting quote").set_value("My unsaved evidence.")
-    label = {"next": "Next ›", "run": "▶ Run AI extraction (1)", "setup": "Save extraction setup"}[action]
+    label = {"next": "Next ›", "run": "▶ Run AI extraction (1 paper · 1 call)", "setup": "Save extraction setup"}[action]
     element(app, "button", label).click().run()
 
     assert not app.exception
-    assert app.session_state["_unsaved_results_test-project"] is True
+    assert app.session_state["project_store"].get("unsaved_results") is True
     assert record(app)["final_answers"]["q1"]["quote"] == "My unsaved evidence."
     assert record(app)["review_state"] == "draft"
-    assert [button.label for button in app.button] == ["Retry saving results"]
+    assert [button.label for button in app.button if not button.disabled] == ["Retry saving results"]
+    assert len(app.get("download_button")) == 1
     assert store["cursors"].get(state.STAGE_EXTRACTION, 0) == 0
     assert store["config"] == before_config
     assert save.call_count == calls_before + 1
@@ -335,15 +360,15 @@ def test_failed_autosave_blocks_actions_and_retries_without_model_calls(ui, monk
 
     app.run()
     assert save.call_count == calls_before + 1
-    assert [button.label for button in app.button] == ["Retry saving results"]
+    assert [button.label for button in app.button if not button.disabled] == ["Retry saving results"]
     element(app, "button", "Retry saving results").click().run()
-    assert app.session_state["_unsaved_results_test-project"] is True
+    assert app.session_state["project_store"].get("unsaved_results") is True
     assert save.call_count == calls_before + 2
     save.return_value = True
     element(app, "button", "Retry saving results").click().run()
 
     assert not app.exception
-    assert "_unsaved_results_test-project" not in app.session_state
+    assert not app.session_state["project_store"].get("unsaved_results")
     assert record(app)["final_answers"]["q1"]["quote"] == "My unsaved evidence."
     assert store["cursors"].get(state.STAGE_EXTRACTION, 0) == 0
     assert store["config"] == before_config
@@ -376,7 +401,7 @@ def test_ai_run_is_not_mistaken_for_a_human_edit(ui):
     create, _, _ = ui
     app = create().run()
     element(app, "text_input", "API key").input("mock-key").run()
-    element(app, "button", "▶ Run AI extraction (1)").click().run()
+    element(app, "button", "▶ Run AI extraction (1 paper · 1 call)").click().run()
     assert not app.exception
     saved = record(app)
     assert saved["ai_answers"]["q1"]["values"] == ["Forest"]
@@ -389,6 +414,53 @@ def test_untouched_empty_form_is_never_stored(ui):
     element(app, "text_area", "Extraction instructions").input("a changed instruction").run()
     assert not app.exception
     assert record(app) == {}
+
+
+@pytest.mark.parametrize("kind", ["multiple_choice", "open_text"])
+def test_clearing_ai_not_reported_autosaves_empty_draft_across_navigation(ui, monkeypatch, kind):
+    create, save, model = ui
+    question = dict(QUESTION, type=kind)
+    app = create(questions=[question])
+    store = app.session_state["project_store"]
+    paper = store["papers"][0]
+    spec = schema.build_spec("Extract from the study only.", [question])
+    extraction.set_ai_result(paper, spec, DIGEST, {"answers": {"q1": {
+        "values": ["Not reported"], "other_text": "", "page": None, "quote": "", "issue": "",
+    }}}, "OpenAI", "model", 2)
+    second = state.new_paper("", "Second study", "")
+    second["uid"] = "paper2"
+    state.set_human_verdict(second, state.STAGE_FULLTEXT, state.VERDICT_INCLUDE,
+                            review_hash=state.criteria_hash(store["config"]["fulltext_criteria"]))
+    store["papers"].append(second)
+    monkeypatch.setattr(db, "load_fulltexts", lambda *args: {
+        uid: {"storage_key": f"mock/{uid}.pdf", "sha256": DIGEST, "status": "ok",
+              "filename": "study.pdf", "file_size": len(PDF), "page_count": 2}
+        for uid in ("paper1", "paper2")})
+    app.run()
+    save.assert_not_called()
+
+    if kind == "multiple_choice":
+        element(app, "multiselect", "Your answers").set_value([]).run()
+    else:
+        element(app, "checkbox", "Not reported").uncheck().run()
+
+    assert not app.exception
+    assert record(app)["review_state"] == "draft"
+    assert record(app)["final_answers"]["q1"]["values"] == []
+    assert save.call_count == 1
+    element(app, "button", "Next ›").click().run()
+    element(app, "button", "‹ Prev").click().run()
+
+    assert not app.exception
+    if kind == "multiple_choice":
+        assert element(app, "multiselect", "Your answers").value == []
+    else:
+        assert not element(app, "checkbox", "Not reported").value
+        assert element(app, "text_area", "Your answer").value == ""
+    assert record(app)["final_answers"]["q1"]["values"] == []
+    assert extraction.get(second) == {}
+    assert save.call_count == 1
+    model.assert_not_called()
 
 
 def test_editing_and_confirming_in_one_interaction_still_confirms(ui):
@@ -434,3 +506,67 @@ def test_a_read_only_form_never_autosaves(ui, monkeypatch):
 
     assert not app.exception
     assert "review_state" not in record(app)
+
+
+def test_untrusted_extraction_content_is_displayed_literally(ui, monkeypatch):
+    create, _, _ = ui
+
+    def payload(field):
+        return f'![{field}](https://example.invalid/{field}) <img src="https://example.invalid/pixel">'
+
+    fields = {name: payload(name) for name in (
+        "project", "title", "question", "guidance", "filename", "answer", "other", "quote", "error", "issue",
+    )}
+    questions = [
+        dict(QUESTION, text=fields["question"], guidance=fields["guidance"]),
+        {"id": "q2", "text": "Reported outcome?", "type": "open_text"},
+    ]
+    app = create(questions=questions)
+    app.session_state["active_project_name"] = fields["project"]
+    app.session_state["extraction:test-project:autosaved"] = fields["title"]
+    paper = app.session_state["project_store"]["papers"][0]
+    paper["title"] = fields["title"]
+    spec = schema.build_spec("Extract from the study only.", questions)
+    extraction.set_ai_result(paper, spec, DIGEST, {"answers": {
+        "q1": dict(ANSWER, values=["Other"], other_text=fields["other"], quote=fields["quote"]),
+        "q2": dict(ANSWER, values=[fields["answer"]]),
+    }}, "OpenAI", "model", 2)
+    extraction.get(paper).update(ai_error=fields["error"], field_errors={"q1": fields["issue"]})
+    monkeypatch.setattr(db, "load_fulltexts", lambda *args: {
+        "paper1": {"storage_key": "mock/paper1.pdf", "sha256": DIGEST, "status": "ok",
+                   "filename": fields["filename"], "file_size": len(PDF), "page_count": 2},
+    })
+
+    app.run()
+
+    assert not app.exception
+    rich_text = [item.value for kind in ("markdown", "caption", "error", "warning", "info")
+                 for item in getattr(app, kind)] + [item.label for item in app.expander]
+    for name in ("project", "title", "question", "guidance", "filename", "other", "error", "issue"):
+        assert any(core_ui.escape_markdown(fields[name]) in text for text in rich_text)
+    assert all(value not in text for value in fields.values() for text in rich_text)
+    plain_text = [item.value for item in app.text]
+    assert fields["answer"] in plain_text
+    assert fields["quote"] in plain_text
+    assert element(app, "text_input", "Question").value == fields["question"]
+    assert record(app)["ai_answers"]["q2"]["values"] == [fields["answer"]]
+
+
+@pytest.mark.parametrize("source", ["database", "storage"])
+def test_extraction_read_errors_cannot_render_remote_images(ui, monkeypatch, source):
+    create, _, _ = ui
+    message = "![request](https://example.invalid/error)"
+
+    def fail(*args):
+        error = db.DatabaseError if source == "database" else fulltext_storage.FulltextStorageError
+        raise error(message)
+
+    if source == "database":
+        monkeypatch.setattr(db, "load_fulltexts", fail)
+    else:
+        monkeypatch.setattr(fulltext_storage, "load_pdf", fail)
+
+    app = create().run()
+
+    assert not app.exception
+    assert any(item.value == core_ui.escape_markdown(message) for item in app.error)

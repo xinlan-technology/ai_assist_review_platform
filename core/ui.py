@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import re
+from urllib.parse import quote, unquote
+
 import streamlit as st
 
 from core.llm import PROVIDERS, PROVIDER_KEY_HELP
@@ -66,8 +69,17 @@ def app_header(title: str, subtitle: str) -> None:
 
 
 def doi_url(doi: str) -> str:
-    doi = doi.strip()
-    return doi if doi.startswith(("http://", "https://")) else f"https://doi.org/{doi}"
+    # Decode first so an already encoded DOI is not encoded twice.
+    doi = re.sub(r"^(?:https?://(?:dx\.|www\.)?doi\.org/|doi:\s*)", "", unquote(doi.strip()), flags=re.I)
+    return (f"https://doi.org/{quote(doi, safe='/')}"
+            if re.fullmatch(r"10\.\d{4,9}(?:\.\d+)*/\S+", doi) else "")
+
+
+def escape_markdown(value: object) -> str:
+    """Render untrusted text without Markdown images, links, or HTML."""
+    # Every ASCII punctuation character may be escaped, which also keeps URLs,
+    # dollar signs and colon shortcodes literal.
+    return re.sub(r"([!-/:-@\[-`{-~])", r"\\\1", str(value))
 
 
 def jump_to_paper(key: str, position: int, labels: list[str]) -> int:
@@ -100,15 +112,39 @@ def model_controls() -> tuple[str, str, str]:
     model = st.selectbox("Model", PROVIDERS[provider], key=f"llm:model:{provider}")
     api_key = st.text_input("API key", type="password", help=PROVIDER_KEY_HELP[provider],
                             key=f"llm:api_key:{provider}")
-    st.caption("Your key stays in this app session (including when you switch pages), "
-               "is never saved to the project database, and is sent only to the "
-               "selected model provider.")
-    return provider, model, api_key
+    st.caption("Your key is kept in this app session, not in project settings. "
+               "It authenticates requests to the selected model provider; "
+               "recorded API errors are redacted.")
+    # Provider keys contain no whitespace; a pasted tab or line break is noise.
+    return provider, model, "".join(api_key.split())
+
+
+def additional_models(provider: str, model: str, api_key: str) -> list[dict]:
+    models = [{"provider": provider, "model": model, "api_key": api_key}]
+    if not st.checkbox("Compare multiple models", key="llm:compare"):
+        return models
+    count = st.selectbox("Number of models", [2, 3], key="llm:count")
+    keys = {provider: api_key}
+    for slot in range(2, count + 1):
+        providers = list(PROVIDERS)
+        default = next((i for i, p in enumerate(providers) if p not in keys), 0)
+        selected = st.selectbox(f"Provider {slot}", providers, index=default, key=f"llm:provider:{slot}")
+        name = st.selectbox(f"Model {slot}", PROVIDERS[selected], key=f"llm:model:{slot}:{selected}")
+        if selected not in keys:
+            keys[selected] = "".join(st.text_input(
+                f"API key · {selected}", type="password", help=PROVIDER_KEY_HELP[selected],
+                key=f"llm:api_key:{selected}",
+            ).split())
+        models.append({"provider": selected, "model": name, "api_key": keys[selected]})
+    st.caption("Each selected model receives the same input in a separate paid call. "
+               "Keys stay in this session; human decisions are not changed by extra runs.")
+    return models
 
 
 def pending_file_cleanup() -> None:
     """Keep failed upload/project cleanup visible until a retry succeeds."""
-    from core import fulltext_storage
+    from core import auth
+    from features.workflow import documents
 
     key = "_uncommitted_pdf_cleanup"
     if not st.session_state.get(key):
@@ -116,10 +152,7 @@ def pending_file_cleanup() -> None:
     st.warning("Some PDF files still need cleanup. Keep this session open and retry; "
                "they have not been confirmed deleted from storage.")
     if st.button("Retry pending file cleanup", key="retry_pending_file_cleanup"):
-        try:
-            fulltext_storage.delete_many(st.session_state[key])
-        except fulltext_storage.FulltextStorageError as exc:
-            st.session_state[key] = exc.failed_keys
-        else:
-            st.session_state.pop(key, None)
+        pending = st.session_state[key]
+        failed = documents.cleanup_keys(auth.current_user(), pending)
+        pending[:] = failed
         st.rerun()

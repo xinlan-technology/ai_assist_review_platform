@@ -14,7 +14,7 @@ if not state.active_id():
     st.info("Open or create a project on the **My Projects** page first.")
     st.stop()
 st.caption(
-    f"Project: **{state.active_name()}**  ·  Workflow: **{state.MODE_LABELS[state.mode()]}**"
+    f"Project: **{ui.escape_markdown(state.active_name())}**  ·  Workflow: **{state.MODE_LABELS[state.mode()]}**"
 )
 
 if not state.has_papers():
@@ -38,17 +38,19 @@ def _screening_block(stage: str, advance_note: str | None) -> None:
             "Agreement rate",
             f"{rate * 100:.0f}%" if rate is not None else "—",
             help="Agreed / (agreed + disagreed). Only papers where both the AI "
-                 "and you gave a verdict count; human-only decisions are excluded.",
+                 "and you gave a verdict count; human-only decisions are excluded. "
+                 "With multiple models, this compares your final verdict with the "
+                 "selected reference result, not agreement among all models.",
         )
         st.progress(s["reviewed"] / s["total"] if s["total"] else 0.0)
         if s["ai_failed"]:
-            st.caption(f"⚠️ {s['ai_failed']} AI call(s) failed — rerun screening to retry.")
+            st.caption(f"⚠️ {s['ai_failed']} AI call(s) failed — retry them on the screening page.")
         if s["ai_invalid"]:
             st.caption(f"⚠️ {s['ai_invalid']} invalid AI response(s) — decide those "
                        "papers yourself (or retry them) on the screening page.")
         if s["stale"]:
-            st.caption(f"⚠️ {s['stale']} AI verdict(s) were produced under earlier "
-                       "criteria — use “Re-run outdated papers” on the screening page.")
+            st.caption(f"⚠️ {s['stale']} review(s) are outdated. Re-run or archive "
+                       "outdated results on the screening page before reviewing again.")
         if s["human_only"]:
             st.caption(f"{s['human_only']} paper(s) were decided without a usable "
                        "AI verdict (excluded from the agreement rate).")
@@ -88,6 +90,16 @@ with st.container(border=True):
         file_name="review_results.csv",
         mime="text/csv",
     )
+    decision_history = state.decision_history_dataframe()
+    if len(decision_history):
+        st.caption(f"{len(decision_history)} earlier screening outcome(s) were archived when "
+                   "criteria or PDFs changed. They are kept with the decisions made at the time.")
+        st.download_button(
+            "⬇ Download screening decision history CSV",
+            data=csv_io.to_csv_bytes(decision_history),
+            file_name="screening_decision_history.csv",
+            mime="text/csv",
+        )
 
 with st.container(border=True):
     st.subheader("Data Extraction")
@@ -99,7 +111,7 @@ with st.container(border=True):
                                      state.config()["extraction_questions"])
             metadata = db.load_fulltexts(auth.current_user(), state.active_id())
         except (ValueError, db.DatabaseError) as exc:
-            st.error(str(exc))
+            st.error(ui.escape_markdown(exc))
         else:
             eligible = [p for _, p in state.stage_papers(state.STAGE_EXTRACTION)]
             counts = reports.summary(eligible, spec, metadata)

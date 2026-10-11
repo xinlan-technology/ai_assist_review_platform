@@ -50,8 +50,8 @@ def test_absent_access_section_means_no_restriction(no_env, monkeypatch):
 
 
 def test_allowlist_is_normalized(no_env, monkeypatch):
-    _secrets(monkeypatch, {"access": {"allowed_emails": [" Name@Example.com ", "b@x.org"]}})
-    assert auth._allowlist() == ["name@example.com", "b@x.org"]
+    _secrets(monkeypatch, {"access": {"allowed_emails": [" Name@Example.com ", "b@example.org"]}})
+    assert auth._allowlist() == ["name@example.com", "b@example.org"]
 
 
 @pytest.mark.parametrize("section", [

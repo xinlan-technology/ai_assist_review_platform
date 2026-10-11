@@ -1,12 +1,13 @@
+import contextlib
 import html
+import json
 
 import pandas as pd
 import streamlit as st
 
-from core import auth, csv_io, db, fulltext_storage, ui
-from core.llm import InvalidModelResponse, error_message
-from features.screening import controls, judge, prompts
-from features.workflow import state
+from core import auth, csv_io, db, ui
+from features.screening import controls, prompts
+from features.workflow import documents, run_controls, runs, state
 
 NONE_OPTION = "(none)"
 STAGE = state.STAGE_ABSTRACT
@@ -32,7 +33,17 @@ state.require_saved_results()
 if STAGE not in state.stages():
     st.info("This project uses the full-text direct workflow — abstract screening is skipped.")
     st.stop()
-st.caption(f"Project: **{state.active_name()}**")
+st.caption(f"Project: **{ui.escape_markdown(state.active_name())}**")
+
+if state.pending_pdf_deletions():
+    st.warning("Removed PDF files still await cleanup. The saved paper list is unaffected.")
+    if st.button("Retry deleting removed PDFs"):
+        try:
+            documents.cleanup(state.prepare_save())
+        except db.DatabaseError as exc:
+            st.error(str(exc))
+        else:
+            st.rerun()
 
 
 def _clean(value) -> str:
@@ -43,6 +54,7 @@ def _clean(value) -> str:
 
 with st.sidebar:
     provider, model, api_key = ui.model_controls()
+    models = ui.additional_models(provider, model, api_key)
     st.divider()
     if st.button("💾 Save project", width="stretch") and state.save_active():
         st.toast("Saved.")
@@ -72,9 +84,15 @@ with st.container(border=True):
         "and an **abstract** column — names can be anything. Other columns are kept "
         "and included in the exported results."
     )
+    st.caption(
+        f"Limits: {csv_io.MAX_CSV_BYTES // (1024 * 1024)} MB, "
+        f"{csv_io.MAX_CSV_ROWS:,} rows, {csv_io.MAX_CSV_COLUMNS:,} columns, "
+        f"{csv_io.MAX_CSV_CELLS:,} data cells, and {csv_io.MAX_CSV_CELL_CHARS:,} characters per cell."
+    )
 
     uploaded = st.file_uploader(
         "CSV file", type=["csv"], help="Example columns: DOI, Title, Abstract",
+        max_upload_size=csv_io.MAX_CSV_BYTES // (1024 * 1024),
         key="abstract_csv_upload",
     )
 
@@ -82,7 +100,7 @@ with st.container(border=True):
         try:
             df = csv_io.read_csv(uploaded)
         except Exception as exc:
-            st.error(f"Could not read the file: {exc}")
+            st.error(f"Could not read the file: {ui.escape_markdown(exc)}")
             df = None
 
         if df is not None and len(df.columns) > 0:
@@ -125,92 +143,56 @@ with st.container(border=True):
                     key="confirm_replace_papers",
                 )
             if st.button("Load papers into project", type="primary", disabled=not replace_ok):
-                attached = {}
+                rows = []
+                for _, row in df.iterrows():
+                    rows.append(state.new_paper(
+                        doi="" if doi_col == NONE_OPTION else _clean(row.get(doi_col)),
+                        title=_clean(row.get(title_col)),
+                        abstract=_clean(row.get(abstract_col)),
+                    ))
                 try:
-                    if state.has_papers():
-                        attached = db.load_fulltexts(auth.current_user(), state.active_id())
+                    documents.replace_papers(
+                        state.prepare_save(), rows,
+                        (list(df.columns), json.loads(df.to_json(orient="records"))),
+                    )
                 except db.DatabaseError as exc:
-                    st.error(f"Could not inspect existing PDF attachments: {exc}")
+                    st.error(f"Could not save the imported papers: {ui.escape_markdown(exc)}")
                 else:
-                    rows = []
-                    for _, row in df.iterrows():
-                        rows.append(state.new_paper(
-                            doi="" if doi_col == NONE_OPTION else _clean(row.get(doi_col)),
-                            title=_clean(row.get(title_col)),
-                            abstract=_clean(row.get(abstract_col)),
-                        ))
-                    state.commit(lambda: state.replace_papers(rows, df.reset_index(drop=True)))
-                    # Persist the replacement before cleaning up old PDFs.
-                    try:
-                        fulltext_storage.delete_many(
-                            [m.get("storage_key") for m in attached.values()
-                             if m.get("storage_key")]
-                        )
-                        db.delete_project_fulltexts(auth.current_user(), state.active_id())
-                    except (db.DatabaseError, fulltext_storage.FulltextStorageError) as exc:
-                        st.warning(
-                            "The new paper list was saved, but some old PDF data "
-                            f"could not be cleaned up: {exc}"
-                        )
-                    else:
-                        # Require a fresh upload and confirmation for another replacement.
-                        st.session_state.pop("confirm_replace_papers", None)
-                        st.session_state.pop("abstract_csv_upload", None)
-                        st.rerun()
+                    # A failed cleanup stays in the saved queue for a later retry.
+                    with contextlib.suppress(db.DatabaseError):
+                        documents.cleanup(state.prepare_save())
+                    st.session_state.pop("confirm_replace_papers", None)
+                    st.session_state.pop("abstract_csv_upload", None)
+                    st.rerun()
 
 
-def _run_screening(targets: list[tuple[int, dict]]) -> bool:
-    """Save each result before the next call; stop on persistence failure."""
-    if not state.save_active():
-        st.error("Stopping before the run — the project could not be saved.")
-        return False
-    chash = state.criteria_hash(criteria)
+def _run_screening(papers: list[dict], *, include: tuple[str, ...] = (runs.NEW,),
+                   refresh: bool = False) -> None:
+    planned = runs.plan(papers, STAGE, screening_spec, None, models, attempts, include=include)
     progress = st.progress(0.0, text="Starting…")
-    total = len(targets)
-    call_failures = invalid_responses = 0
-    for n, (_, paper) in enumerate(targets):
-        try:
-            result = judge.judge_abstract(
-                provider, model, api_key, criteria,
-                paper["title"], paper["abstract"],
-            )
-            state.set_ai_result(
-                paper, STAGE, result["verdict"], result["reason"],
-                provider, model, chash, prompts.ABSTRACT_PROMPT_VERSION,
-            )
-        except InvalidModelResponse as exc:
-            state.set_ai_error(paper, STAGE, error_message(exc, api_key), state.ERROR_INVALID_RESPONSE)
-            invalid_responses += 1
-        except Exception as exc:
-            state.set_ai_error(paper, STAGE, error_message(exc, api_key), state.ERROR_CALL_FAILED)
-            call_failures += 1
-        if not state.save_result():
-            progress.empty()
-            st.rerun()
-        progress.progress((n + 1) / total, text=f"Screening… {n + 1}/{total}")
+    ok = runs.execute(papers, STAGE, screening_spec, None, models, include=include, refresh=refresh,
+                      progress=lambda n, total: progress.progress(n / total))
     progress.empty()
-    if call_failures:
-        st.warning(
-            f"{call_failures} call(s) failed — run again to retry just those."
-        )
-    if invalid_responses:
-        st.warning(
-            f"{invalid_responses} paper(s) got an invalid model response. They are "
-            "NOT retried automatically — set a verdict yourself in the review below, "
-            "or use “Retry invalid responses”."
-        )
-    if not call_failures and not invalid_responses:
-        st.success("Done. Review the verdicts below.")
-    return True
+    if ok:
+        st.session_state["abstract:run_notice"] = run_controls.finished(planned)
+    if ok or state.prepare_save().store.get("pending_ai_completion") or state.has_unsaved_results():
+        st.rerun()
 
 
+screening_spec = {"criteria": criteria, "prompt_version": prompts.ABSTRACT_PROMPT_VERSION}
 if state.has_papers():
     with st.container(border=True):
         st.subheader("AI screening")
+        notice = st.session_state.pop("abstract:run_notice", None)
+        if notice:
+            st.success(notice)
         s = state.stage_summary(STAGE)
-        pending = state.pending_papers(STAGE)
-        stale = state.stale_papers(STAGE)
+        pending = [p for _, p in state.pending_papers(STAGE)]
+        stale = [p for _, p in state.stale_papers(STAGE)]
         invalid = state.invalid_papers(STAGE)
+        stale_uids = {p["uid"] for p in stale}
+        current = [p for _, p in state.stage_papers(STAGE) if p["uid"] not in stale_uids]
+        undecided = runs.awaiting_models(current, STAGE)
 
         parts = [f"{s['total']} papers", f"{s['ai_done']} screened"]
         if s["ai_failed"]:
@@ -222,40 +204,66 @@ if state.has_papers():
 
         if not criteria.strip():
             st.info("Write your eligibility criteria above before running the AI.")
-        if pending:
+        attempts = run_controls.attempts(STAGE)
+        new_tasks = saved = refresh_tasks = refresh_saved = []
+        known = None
+        if attempts is not None:
+            known = runs.outcomes(current + stale, STAGE, screening_spec, None, attempts)
+            try:
+                new_tasks = runs.plan(undecided, STAGE, screening_spec, None, models, attempts, known=known)
+                refresh_tasks = runs.plan(stale, STAGE, screening_spec, None, models, attempts,
+                                          include=(runs.NEW, runs.FAILED, runs.INVALID), known=known)
+            except ValueError as exc:
+                st.warning(str(exc))
+                attempts = None
+            else:
+                saved = runs.restorable(undecided, STAGE, screening_spec, None, attempts, known=known)
+                refresh_saved = runs.restorable(stale, STAGE, screening_spec, None, attempts,
+                                                refresh=True, known=known)
+        ready = bool(attempts is not None and criteria.strip()
+                     and all(m.get("api_key") for m in models))
+        if new_tasks:
             st.caption(
-                f"Each remaining paper is screened by {provider} · {model} "
-                f"(~{len(pending)} API calls), billed to your own key. Progress is "
-                "saved after every paper, so an interrupted run resumes where it "
-                "stopped. Papers you already decided yourself are not re-billed."
+                f"Each remaining paper is screened by {len(models)} selected model(s), "
+                "billed to your own keys. Progress is saved after every call, so an "
+                "interrupted run resumes where it stopped. Papers you already decided "
+                "yourself are not re-billed."
             )
+        if saved:
+            st.caption(f"{len(saved)} paper(s) already have a saved AI answer; "
+                       "it is shown without a new call.")
         if st.button(
-            f"▶ Run AI screening ({len(pending)} remaining)",
+            f"▶ Run AI screening ({runs.describe(new_tasks)})",
             type="primary",
-            disabled=not api_key or not criteria.strip() or not pending,
+            disabled=not ready or not (new_tasks or saved),
         ):
-            _run_screening(pending)
+            _run_screening(undecided)
+        if attempts is not None:
+            run_controls.unlinked_note(STAGE, current, screening_spec, None, models, attempts)
+            run_controls.retry_controls(
+                STAGE, current, screening_spec, None, models, attempts,
+                lambda papers, include: _run_screening(papers, include=include),
+                disabled=not ready, known=known,
+            )
 
         if stale:
             reviewed_stale = sum(
-                1 for _, p in stale if state.is_reviewed(p, STAGE)
+                1 for p in stale if state.is_reviewed(p, STAGE)
             )
             st.warning(
                 f"⚠️ {len(stale)} paper(s) have results from **earlier criteria**. "
                 "Outdated results don't count as reviewed and don't advance to "
                 "the next stage — refresh them below."
-                + (f" {reviewed_stale} had review decisions, which a refresh "
-                   "moves to the project history." if reviewed_stale else "")
+                + (f" {reviewed_stale} had review decisions; a refresh moves them, "
+                   "with the old result, to the paper's history." if reviewed_stale else "")
             )
             rerun_col, archive_col = st.columns(2)
             if rerun_col.button(
-                f"↻ Re-run outdated papers ({len(stale)})",
-                disabled=not api_key or not criteria.strip(),
+                f"↻ Re-run outdated papers ({runs.describe(refresh_tasks, len(stale))})",
+                disabled=not ready or not (refresh_tasks or refresh_saved),
                 width="stretch",
             ):
-                state.commit(lambda: [state.archive_ai_result(p, STAGE) for _, p in stale])
-                if _run_screening(stale):
-                    st.rerun()
+                _run_screening(stale, include=(runs.NEW, runs.FAILED, runs.INVALID), refresh=True)
             archive_ok = not reviewed_stale or archive_col.checkbox(
                 f"I understand this resets {reviewed_stale} recorded decision(s).",
                 key="confirm_archive_abstract",
@@ -268,15 +276,17 @@ if state.has_papers():
                 width="stretch",
                 disabled=not archive_ok,
             ):
-                state.commit(lambda: [state.archive_ai_result(p, STAGE) for _, p in stale])
+                state.commit(lambda: [state.archive_ai_result(p, STAGE) for p in stale])
                 st.session_state.pop("confirm_archive_abstract", None)
                 st.rerun()
+            if attempts is not None:
+                run_controls.retry_controls(
+                    STAGE, stale, screening_spec, None, models, attempts,
+                    lambda papers, include: _run_screening(papers, include=include, refresh=True),
+                    disabled=not ready, scope="outdated", categories=(runs.UNKNOWN,), known=known,
+                )
 
-        if invalid and st.button(
-            f"↻ Retry invalid responses ({len(invalid)})",
-            disabled=not api_key or not criteria.strip(),
-        ) and _run_screening(invalid):
-            st.rerun()
+    run_controls.panel(STAGE, state.papers(), screening_spec, models=models)
 
     with st.container(border=True):
         st.subheader("Review")
@@ -319,15 +329,16 @@ if state.has_papers():
             state.goto(STAGE, i + 1, total)
             st.rerun()
 
-        st.markdown(f"#### {paper['title'] or '(no title)'}")
+        st.markdown(f"#### {ui.escape_markdown(paper['title'] or '(no title)')}")
         if paper.get("doi"):
-            st.markdown(f"[{paper['doi']}]({ui.doi_url(paper['doi'])})")
-        st.write(paper["abstract"] or "_(no abstract)_")
+            label, url = ui.escape_markdown(paper["doi"]), ui.doi_url(paper["doi"])
+            st.markdown(f"[{label}]({url})" if url else label)
+        st.text(paper["abstract"] or "(no abstract)")
 
         ai_verdict = stg.get("ai_verdict")
         if ai_verdict:
             color = BADGE_COLORS.get(ai_verdict, "#5A626B")
-            st.markdown(
+            st.html(
                 f"""<div style="background:#F6F8F7;border:1px solid #E2EBE7;border-radius:8px;
                             padding:10px 12px;margin:6px 0 10px;">
                   <span style="background:{color};color:#fff;font-size:12px;font-weight:600;
@@ -336,19 +347,19 @@ if state.has_papers():
                   <div style="font-size:12px;color:#5A626B;font-style:italic;margin-top:5px;">
                     {html.escape(stg.get("ai_reason") or "")}</div>
                 </div>""",
-                unsafe_allow_html=True,
             )
         elif stg.get("ai_error"):
             if stg.get("ai_error_kind") == state.ERROR_INVALID_RESPONSE:
                 st.error(
                     f"The AI returned an invalid response (not retried "
-                    f"automatically): {stg['ai_error']}"
+                    f"automatically): {ui.escape_markdown(stg['ai_error'])}"
                 )
             else:
-                st.error(f"AI screening failed for this paper: {stg['ai_error']}")
+                st.error(f"AI screening failed for this paper: {ui.escape_markdown(stg['ai_error'])}")
         else:
             st.info("Not screened by the AI yet — run AI screening above, or set a verdict yourself.")
 
+        run_controls.screening_review(paper, STAGE, screening_spec)
         controls.decision_controls(
             paper, STAGE, chash, position=i, total=total,
             stale_note=(

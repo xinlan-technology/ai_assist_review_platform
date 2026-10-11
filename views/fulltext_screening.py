@@ -1,24 +1,18 @@
 from __future__ import annotations
 
-import copy
 import html
 from pathlib import Path
-from uuid import uuid4
 
 import pandas as pd
 import streamlit as st
 
 from core import auth, db, fulltext_storage, ui
-from core.llm import (
-    InvalidModelResponse,
-    error_message,
-    pdf_input_issue,
-)
-from features.screening import controls, judge, prompts
-from features.workflow import state
+from core.llm import pdf_input_issue
+from features.screening import controls, prompts
+from features.workflow import documents, run_controls, runs, state
 
 STAGE = state.STAGE_FULLTEXT
-MAX_UPLOAD_PDF_BYTES = 50 * 1024 * 1024
+MAX_UPLOAD_PDF_MB = fulltext_storage.MAX_UPLOAD_PDF_BYTES // (1024 * 1024)
 
 BADGE_COLORS = {
     state.VERDICT_INCLUDE: "#0E6E55",
@@ -43,7 +37,7 @@ if STAGE not in state.stages():
 user = auth.current_user()
 project_id = state.active_id()
 st.caption(
-    f"Project: **{state.active_name()}**  ·  Workflow: **{state.MODE_LABELS[state.mode()]}**"
+    f"Project: **{ui.escape_markdown(state.active_name())}**  ·  Workflow: **{state.MODE_LABELS[state.mode()]}**"
 )
 
 
@@ -57,7 +51,7 @@ def _read_metadata() -> dict[str, dict]:
     try:
         return db.load_fulltexts(user, project_id)
     except db.DatabaseError as exc:
-        st.error(str(exc))
+        st.error(ui.escape_markdown(exc))
         st.stop()
 
 
@@ -72,7 +66,7 @@ def _cached_pdf(storage_key: str, digest: str) -> bytes:
 
 def _prepare_upload(uploaded) -> tuple[bytes, str, int | None, str]:
     data = uploaded.getvalue()
-    if len(data) > MAX_UPLOAD_PDF_BYTES:
+    if len(data) > fulltext_storage.MAX_UPLOAD_PDF_BYTES:
         raise fulltext_storage.FulltextStorageError(
             f"{uploaded.name} is larger than 50 MB. Compress it before uploading."
         )
@@ -88,46 +82,18 @@ def _attach_prepared(
     page_count: int | None,
     digest: str,
     metadata: dict[str, dict],
+    *,
+    new_paper: bool = False,
 ) -> bool:
-    """Store the new PDF and commit its metadata before old-file cleanup."""
-    uid = paper["uid"]
-    old = metadata.get(uid) or {}
-    same_source = bool(old.get("sha256") == digest and old.get("storage_key"))
-
-    old_stages = copy.deepcopy(paper.get("stages", {}))
-    old_cleanup = copy.deepcopy(state.pending_pdf_deletions())
-    key = fulltext_storage.object_key(user, project_id, uid, f"{digest}-{uuid4().hex}")
-    entry = {
-        "paper_uid": uid, "filename": filename, "storage_key": key, "sha256": digest,
-        "file_size": len(data), "page_count": page_count, "status": "ok", "error": None, "text": None,
-    }
-    try:
-        fulltext_storage.save_pdf(key, data)
-        state.archive_document_results(
-            paper,
-            old.get("sha256") or (f"unknown:{old.get('storage_key')}" if old.get("storage_key") else None),
-            digest,
-        )
-        if old.get("storage_key"):
-            state.pending_pdf_deletions().append({"paper_uid": None, "storage_key": old["storage_key"]})
-        # Commit metadata and archived decisions in the same versioned transaction.
-        if not state.save_active(fulltext=entry):
-            raise RuntimeError("The project changed or could not be saved. Reload before attaching the PDF again.")
-    except Exception:
-        paper["stages"] = old_stages
-        state.pending_pdf_deletions()[:] = old_cleanup
-        # Roll back only this attempt's unique storage key.
-        try:
-            fulltext_storage.delete_pdf(key)
-        except fulltext_storage.FulltextStorageError:
-            st.session_state.setdefault("_uncommitted_pdf_cleanup", []).append(key)
-        raise
-
-    metadata[uid] = {name: value for name, value in entry.items() if name != "paper_uid"}
+    save = state.prepare_save()
+    failed_cleanup = st.session_state.setdefault("_uncommitted_pdf_cleanup", [])
+    entry, changed = documents.attach(
+        save, paper, data, filename, page_count, digest, failed_cleanup, new_paper=new_paper,
+    )
+    metadata[paper["uid"]] = {name: value for name, value in entry.items() if name != "paper_uid"}
     _cached_pdf.clear()
     _cleanup_removed_pdfs()
-    # Rewriting identical content repairs a missing object without changing provenance.
-    return not same_source
+    return changed
 
 
 def _show_pdf(pdf_bytes: bytes) -> None:
@@ -135,25 +101,15 @@ def _show_pdf(pdf_bytes: bytes) -> None:
 
 
 def _cleanup_removed_pdfs() -> bool:
-    completed = []
-    for target in state.pending_pdf_deletions():
-        try:
-            fulltext_storage.delete_pdf(target.get("storage_key"))
-            if target.get("paper_uid"):
-                db.delete_fulltext(user, project_id, target["paper_uid"])
-        except (db.DatabaseError, fulltext_storage.FulltextStorageError):
-            continue
-        completed.append(target)
-    if completed:
-        def forget_completed():
-            pending = state.pending_pdf_deletions()
-            pending[:] = [target for target in pending if target not in completed]
-        state.commit(forget_completed)
-    return not state.pending_pdf_deletions()
+    try:
+        return documents.cleanup(state.prepare_save())
+    except db.DatabaseError:
+        return False
 
 
 with st.sidebar:
     provider, model, api_key = ui.model_controls()
+    models = ui.additional_models(provider, model, api_key)
     st.divider()
     if st.button("💾 Save project", width="stretch", key="save_fulltext_project") and state.save_active():
         st.toast("Saved.")
@@ -196,7 +152,7 @@ with st.container(border=True):
         st.caption(f"Storage: {fulltext_storage.backend_label()} · original PDFs are kept unchanged.")
     except fulltext_storage.FulltextStorageError as exc:
         storage_ready = False
-        st.error(str(exc))
+        st.error(ui.escape_markdown(exc))
 
     if state.mode() == state.MODE_DIRECT:
         st.caption(
@@ -207,6 +163,7 @@ with st.container(border=True):
             "PDF files",
             type=["pdf"],
             accept_multiple_files=True,
+            max_upload_size=MAX_UPLOAD_PDF_MB,
             key="direct_pdf_uploads",
         )
         if st.button(
@@ -223,31 +180,33 @@ with st.container(border=True):
                 for uid, meta in fulltexts.items()
                 if uid in current_uids and meta.get("sha256")
             }
-            for uploaded in direct_uploads:
-                paper = None
+            for position, uploaded in enumerate(direct_uploads):
                 try:
                     data, filename, pages, digest = _prepare_upload(uploaded)
                     if digest in known_hashes:
                         skipped += 1
                         continue
                     paper = state.new_paper("", Path(filename).stem, "")
-                    state.append_papers([paper])
                     changed = _attach_prepared(
-                        paper, data, filename, pages, digest, fulltexts
+                        paper, data, filename, pages, digest, fulltexts, new_paper=True,
                     )
                     known_hashes.add(digest)
                     added += int(changed)
                 except Exception as exc:
-                    if paper is not None:
-                        state.remove_paper(paper["uid"])
-                        fulltexts.pop(paper["uid"], None)
                     errors.append(f"{getattr(uploaded, 'name', 'PDF')}: {exc}")
+                    if isinstance(exc, db.DatabaseError):
+                        # Later files were not attempted; name them so none is missed.
+                        untried = [getattr(item, "name", "PDF") for item in direct_uploads[position + 1:]]
+                        if untried:
+                            errors.append("Not processed after the database error: " + ", ".join(untried))
+                        break
             if errors:
-                st.error("Some PDFs could not be added:\n\n" + "\n\n".join(errors))
+                st.session_state["_fulltext_upload_errors"] = errors
             if added or skipped:
                 st.session_state["_fulltext_upload_notice"] = (
                     f"Added {added} PDF(s)" + (f"; skipped {skipped} duplicate(s)." if skipped else ".")
                 )
+            if errors or added or skipped:
                 st.rerun()
     else:
         if not eligible:
@@ -274,6 +233,7 @@ with st.container(border=True):
                 "Matching PDF",
                 type=["pdf"],
                 accept_multiple_files=False,
+                max_upload_size=MAX_UPLOAD_PDF_MB,
                 key=f"matched_pdf_{selected_uid}",
             )
             if st.button(
@@ -283,14 +243,12 @@ with st.container(border=True):
                 key="attach_prisma_pdf",
             ):
                 try:
-                    if not state.save_active():
-                        raise RuntimeError("the project could not be saved before upload")
                     data, filename, pages, digest = _prepare_upload(matched_upload)
                     changed = _attach_prepared(
                         by_uid[selected_uid], data, filename, pages, digest, fulltexts
                     )
                 except Exception as exc:
-                    st.error(f"Could not attach the PDF: {exc}")
+                    st.error(f"Could not attach the PDF: {ui.escape_markdown(exc)}")
                 else:
                     st.session_state["_fulltext_upload_notice"] = (
                         "PDF attached." if changed else "That exact PDF was already attached."
@@ -300,6 +258,9 @@ with st.container(border=True):
     notice = st.session_state.pop("_fulltext_upload_notice", None)
     if notice:
         st.success(notice)
+    upload_errors = st.session_state.pop("_fulltext_upload_errors", None)
+    if upload_errors:
+        st.error("Some PDFs could not be added:\n\n" + ui.escape_markdown("\n\n".join(upload_errors)))
 
     eligible = state.stage_papers(STAGE)
     if eligible:
@@ -342,79 +303,39 @@ def _has_ready_pdf(paper: dict) -> bool:
         and meta.get("status") == "ok"
         and meta.get("storage_key")
         and meta.get("sha256")
-        and not pdf_input_issue(
-            provider, model, meta.get("file_size"), meta.get("page_count")
-        )
+        and any(not pdf_input_issue(m["provider"], m["model"], meta.get("file_size"), meta.get("page_count"))
+                for m in models)
     )
 
 
-def _run_screening(targets: list[tuple[int, dict]]) -> bool:
-    if not state.save_active():
-        st.error("Stopping before the run — the project could not be saved.")
-        return False
-    chash = state.criteria_hash(criteria)
+def _run_screening(papers: list[dict], *, include: tuple[str, ...] = (runs.NEW,),
+                   refresh: bool = False) -> None:
+    planned = runs.plan(papers, STAGE, screening_spec, fulltexts, models, attempts, include=include)
     progress = st.progress(0.0, text="Starting…")
-    total = len(targets)
-    call_failures = invalid_responses = 0
-    for n, (_, paper) in enumerate(targets):
-        meta = fulltexts.get(paper["uid"]) or {}
-        try:
-            pdf_bytes = fulltext_storage.load_pdf(meta["storage_key"])
-            if fulltext_storage.sha256(pdf_bytes) != meta.get("sha256"):
-                raise fulltext_storage.FulltextStorageError("The stored PDF differs from its metadata. Reattach it first.")
-            result = judge.judge_fulltext(
-                provider,
-                model,
-                api_key,
-                criteria,
-                paper.get("title", ""),
-                pdf_bytes,
-                meta.get("filename") or "paper.pdf",
-            )
-            state.set_ai_result(
-                paper,
-                STAGE,
-                result["verdict"],
-                result["reason"],
-                provider,
-                model,
-                chash,
-                prompts.FULLTEXT_PROMPT_VERSION,
-            )
-        except InvalidModelResponse as exc:
-            state.set_ai_error(paper, STAGE, error_message(exc, api_key), state.ERROR_INVALID_RESPONSE)
-            invalid_responses += 1
-        except Exception as exc:
-            state.set_ai_error(paper, STAGE, error_message(exc, api_key), state.ERROR_CALL_FAILED)
-            call_failures += 1
-        if not state.save_result():
-            progress.empty()
-            st.rerun()
-        progress.progress((n + 1) / total, text=f"Screening PDFs… {n + 1}/{total}")
+    ok = runs.execute(papers, STAGE, screening_spec, fulltexts, models, include=include,
+                      refresh=refresh, progress=lambda n, total: progress.progress(n / total))
     progress.empty()
-    if call_failures:
-        st.warning(f"{call_failures} call(s) failed; run again to retry only those papers.")
-    if invalid_responses:
-        st.warning(
-            f"{invalid_responses} response(s) did not follow the required output. "
-            "Decide them yourself or retry explicitly."
-        )
-    if not call_failures and not invalid_responses:
-        st.success("AI full-text screening finished. Review the decisions below.")
-    return True
+    if ok:
+        st.session_state["fulltext:run_notice"] = run_controls.finished(planned)
+    if ok or state.prepare_save().store.get("pending_ai_completion") or state.has_unsaved_results():
+        st.rerun()
 
 
+screening_spec = {"criteria": criteria, "prompt_version": prompts.FULLTEXT_PROMPT_VERSION}
 eligible = state.stage_papers(STAGE)
 if eligible:
     with st.container(border=True):
         st.subheader("AI full-text screening")
+        notice = st.session_state.pop("fulltext:run_notice", None)
+        if notice:
+            st.success(notice)
         summary = state.stage_summary(STAGE)
-        pending_all = state.pending_papers(STAGE)
-        pending = [(i, p) for i, p in pending_all if _has_ready_pdf(p)]
-        stale_all = state.stale_papers(STAGE)
-        stale_ready = [(i, p) for i, p in stale_all if _has_ready_pdf(p)]
-        invalid_all = state.invalid_papers(STAGE)
-        invalid_ready = [(i, p) for i, p in invalid_all if _has_ready_pdf(p)]
+        pending = [p for _, p in state.pending_papers(STAGE) if _has_ready_pdf(p)]
+        stale_all = [p for _, p in state.stale_papers(STAGE)]
+        stale_ready = [p for p in stale_all if _has_ready_pdf(p)]
+        stale_uids = {p["uid"] for p in stale_all}
+        current = [p for _, p in eligible if p["uid"] not in stale_uids and _has_ready_pdf(p)]
+        undecided = runs.awaiting_models(current, STAGE)
         missing = sum(1 for _, paper in eligible if not _has_ready_pdf(paper))
 
         parts = [
@@ -438,33 +359,61 @@ if eligible:
                 "Some PDFs are outside the selected model's size or page limits. They "
                 "remain available for human review and are not sent to the model."
             )
-        if pending:
+        attempts = run_controls.attempts(STAGE)
+        new_tasks = saved = refresh_tasks = refresh_saved = []
+        known = None
+        if attempts is not None:
+            known = runs.outcomes(current + stale_ready, STAGE, screening_spec, fulltexts, attempts)
+            try:
+                new_tasks = runs.plan(undecided, STAGE, screening_spec, fulltexts, models, attempts, known=known)
+                refresh_tasks = runs.plan(stale_ready, STAGE, screening_spec, fulltexts, models, attempts,
+                                          include=(runs.NEW, runs.FAILED, runs.INVALID), known=known)
+            except ValueError as exc:
+                st.warning(str(exc))
+                attempts = None
+            else:
+                saved = runs.restorable(undecided, STAGE, screening_spec, fulltexts, attempts, known=known)
+                refresh_saved = runs.restorable(stale_ready, STAGE, screening_spec, fulltexts,
+                                                attempts, refresh=True, known=known)
+        ready = bool(attempts is not None and criteria.strip()
+                     and all(m.get("api_key") for m in models))
+        if new_tasks:
             st.caption(
-                f"The original PDF is sent directly to {provider} · {model}; one API call "
-                "per paper. Results are saved after every call."
+                f"The original PDF is sent to {len(models)} selected model(s). "
+                "Results are saved after every call."
             )
+        if saved:
+            st.caption(f"{len(saved)} paper(s) already have a saved AI answer; "
+                       "it is shown without a new call.")
         if st.button(
-            f"▶ Run AI on ready PDFs ({len(pending)})",
+            f"▶ Run AI on ready PDFs ({runs.describe(new_tasks)})",
             type="primary",
-            disabled=not api_key or not criteria.strip() or not pending,
+            disabled=not ready or not (new_tasks or saved),
             key="run_fulltext_ai",
         ):
-            _run_screening(pending)
+            _run_screening(undecided)
+        if attempts is not None:
+            run_controls.unlinked_note(STAGE, current, screening_spec, fulltexts, models, attempts)
+            run_controls.retry_controls(
+                STAGE, current, screening_spec, fulltexts, models, attempts,
+                lambda papers, include: _run_screening(papers, include=include),
+                disabled=not ready, known=known,
+            )
 
         if stale_all:
+            reviewed_stale = sum(1 for p in stale_all if state.final_verdict(p, STAGE))
             st.warning(
                 f"{len(stale_all)} result(s) use an earlier prompt and no longer count."
+                + (f" {reviewed_stale} had review decisions; a refresh moves them, "
+                   "with the old result, to the paper's history." if reviewed_stale else "")
             )
             rerun_col, archive_col = st.columns(2)
             if rerun_col.button(
-                f"↻ Re-run outdated PDFs ({len(stale_ready)})",
-                disabled=not api_key or not criteria.strip() or not stale_ready,
+                f"↻ Re-run outdated PDFs ({runs.describe(refresh_tasks, len(stale_ready))})",
+                disabled=not ready or not (refresh_tasks or refresh_saved),
                 width="stretch",
             ):
-                state.commit(lambda: [state.archive_ai_result(p, STAGE) for _, p in stale_ready])
-                if _run_screening(stale_ready):
-                    st.rerun()
-            reviewed_stale = sum(1 for _, p in stale_all if state.final_verdict(p, STAGE))
+                _run_screening(stale_ready, include=(runs.NEW, runs.FAILED, runs.INVALID), refresh=True)
             archive_ok = not reviewed_stale or archive_col.checkbox(
                 f"I understand this resets {reviewed_stale} recorded decision(s).",
                 key="confirm_archive_fulltext",
@@ -475,15 +424,17 @@ if eligible:
                 disabled=not archive_ok,
                 help="Moves the old results to history and marks those papers pending.",
             ):
-                state.commit(lambda: [state.archive_ai_result(p, STAGE) for _, p in stale_all])
+                state.commit(lambda: [state.archive_ai_result(p, STAGE) for p in stale_all])
                 st.session_state.pop("confirm_archive_fulltext", None)
                 st.rerun()
+            if attempts is not None:
+                run_controls.retry_controls(
+                    STAGE, stale_ready, screening_spec, fulltexts, models, attempts,
+                    lambda papers, include: _run_screening(papers, include=include, refresh=True),
+                    disabled=not ready, scope="outdated", categories=(runs.UNKNOWN,), known=known,
+                )
 
-        if invalid_ready and st.button(
-            f"↻ Retry invalid responses ({len(invalid_ready)})",
-            disabled=not api_key or not criteria.strip(),
-        ) and _run_screening(invalid_ready):
-            st.rerun()
+    run_controls.panel(STAGE, [p for _, p in eligible], screening_spec, fulltexts, models=models)
 
     with st.container(border=True):
         st.subheader("Human review")
@@ -528,9 +479,10 @@ if eligible:
             state.goto(STAGE, pos + 1, total)
             st.rerun()
 
-        st.markdown(f"#### {paper.get('title') or '(no title)'}")
+        st.markdown(f"#### {ui.escape_markdown(paper.get('title') or '(no title)')}")
         if paper.get("doi"):
-            st.markdown(f"[{paper['doi']}]({ui.doi_url(paper['doi'])})")
+            label, url = ui.escape_markdown(paper["doi"]), ui.doi_url(paper["doi"])
+            st.markdown(f"[{label}]({url})" if url else label)
 
         pdf_col, decision_col = st.columns([3, 2], gap="large")
         with pdf_col:
@@ -540,17 +492,17 @@ if eligible:
             if not attached:
                 st.warning(
                     "No PDF is attached to this paper. You can still record your own "
-                    "verdict — for example, exclude a paper whose full text cannot be "
-                    "obtained — but the AI cannot screen it."
+                    "verdict if you have reviewed the full text elsewhere, but the AI "
+                    "cannot screen it. A missing PDF alone is not an exclusion reason."
                 )
             else:
                 try:
                     pdf_bytes = _cached_pdf(meta["storage_key"], meta.get("sha256") or "")
                 except fulltext_storage.FulltextStorageError as exc:
-                    st.error(str(exc))
+                    st.error(ui.escape_markdown(exc))
                 if pdf_bytes:
                     st.caption(
-                        f"{meta.get('filename') or 'paper.pdf'}"
+                        ui.escape_markdown(meta.get('filename') or 'paper.pdf')
                         + (f" · {meta['page_count']} pages" if meta.get("page_count") else "")
                     )
                     st.download_button(
@@ -573,7 +525,7 @@ if eligible:
             ai_verdict = stg.get("ai_verdict")
             if ai_verdict:
                 color = BADGE_COLORS.get(ai_verdict, "#5A626B")
-                st.markdown(
+                st.html(
                     f"""<div style="background:#F6F8F7;border:1px solid #E2EBE7;
                                 border-radius:8px;padding:10px 12px;margin:6px 0 10px;">
                       <span style="background:{color};color:#fff;font-size:12px;font-weight:600;
@@ -582,16 +534,15 @@ if eligible:
                       <div style="font-size:12px;color:#5A626B;font-style:italic;margin-top:7px;">
                         {html.escape(stg.get('ai_reason') or '')}</div>
                     </div>""",
-                    unsafe_allow_html=True,
                 )
                 st.caption(
-                    f"{stg.get('provider') or ''} · {stg.get('model') or ''}".strip(" ·")
+                    ui.escape_markdown(f"{stg.get('provider') or ''} · {stg.get('model') or ''}".strip(" ·"))
                 )
             elif stg.get("ai_error"):
                 if stg.get("ai_error_kind") == state.ERROR_INVALID_RESPONSE:
-                    st.error(f"Invalid AI response: {stg['ai_error']}")
+                    st.error(f"Invalid AI response: {ui.escape_markdown(stg['ai_error'])}")
                 else:
-                    st.error(f"AI call failed: {stg['ai_error']}")
+                    st.error(f"AI call failed: {ui.escape_markdown(stg['ai_error'])}")
             else:
                 st.info(
                     "No AI verdict yet."
@@ -602,6 +553,8 @@ if eligible:
                     )
                 )
 
+            run_controls.screening_review(paper, STAGE, screening_spec, fulltexts,
+                                          disabled=review_disabled)
             controls.decision_controls(
                 paper, STAGE, chash, position=pos, total=total,
                 disabled=review_disabled,
@@ -634,7 +587,8 @@ if eligible:
                     "deletes it, its decisions and its stored PDF for good."
                 )
                 replacement = st.file_uploader(
-                    "Replacement PDF", type=["pdf"], key=f"replace_pdf_{paper['uid']}"
+                    "Replacement PDF", type=["pdf"], key=f"replace_pdf_{paper['uid']}",
+                    max_upload_size=MAX_UPLOAD_PDF_MB,
                 )
                 if st.button(
                     "Replace PDF", key=f"do_replace_{paper['uid']}",
@@ -654,7 +608,7 @@ if eligible:
                             )
                         changed = _attach_prepared(paper, data, filename, pages, digest, fulltexts)
                     except Exception as exc:
-                        st.error(f"Could not replace the PDF: {exc}")
+                        st.error(f"Could not replace the PDF: {ui.escape_markdown(exc)}")
                     else:
                         st.session_state["_fulltext_upload_notice"] = (
                             "PDF replaced." if changed else "That exact PDF was already attached."
@@ -669,10 +623,11 @@ if eligible:
                     "Remove this paper", type="primary", disabled=not remove_ok,
                     key=f"do_remove_{paper['uid']}",
                 ):
-                    removed_uid = paper["uid"]
-                    storage_key = (meta or {}).get("storage_key")
-                    # Persist removal before deleting the stored PDF.
-                    state.commit(lambda: state.remove_paper_with_cleanup(removed_uid, storage_key))
+                    try:
+                        documents.remove(state.prepare_save(), paper["uid"])
+                    except db.DatabaseError as exc:
+                        st.error(ui.escape_markdown(exc))
+                        st.stop()
                     cleaned = _cleanup_removed_pdfs()
                     _cached_pdf.clear()
                     st.session_state[f"jump_{STAGE}_{project_id}:moved"] = 0

@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
-from io import BytesIO
 from pathlib import Path, PurePosixPath
+import subprocess
+import sys
 
 import streamlit as st
 
@@ -13,6 +15,11 @@ from core import auth
 
 class FulltextStorageError(RuntimeError):
     pass
+
+
+MAX_UPLOAD_PDF_BYTES = 50 * 1024 * 1024
+PDF_INSPECTION_TIMEOUT = 10
+_PDF_INSPECTION_ERROR = "The PDF could not be inspected safely. Try a repaired or smaller copy."
 
 
 def _local_storage_allowed() -> bool:
@@ -56,28 +63,33 @@ def ensure_configured() -> None:
 
 
 def inspect_pdf(data: bytes) -> int | None:
-    """Check PDF signature and encryption; return page count when readable."""
-    if not data or not data.lstrip().startswith(b"%PDF-"):
+    """Inspect untrusted PDFs in a bounded child, never in the app process."""
+    if not isinstance(data, (bytes, bytearray)) or not data or not data.lstrip().startswith(b"%PDF-"):
         raise FulltextStorageError("The uploaded file is not a valid PDF.")
+    if len(data) > MAX_UPLOAD_PDF_BYTES:
+        raise FulltextStorageError("The PDF is larger than 50 MB. Compress it before uploading.")
     try:
-        from pypdf import PdfReader
-
-        reader = PdfReader(BytesIO(data), strict=False)
-        if reader.is_encrypted:
-            try:
-                unlocked = reader.decrypt("")
-            except Exception:
-                unlocked = 0
-            if not unlocked:
-                raise FulltextStorageError(
-                    "Password-protected PDFs are not supported. Upload an unlocked copy."
-                )
-        return len(reader.pages)
-    except FulltextStorageError:
-        raise
-    except Exception:
-        # Tolerate parser failures; page count is diagnostic only.
-        return None
+        result = subprocess.run(
+            [sys.executable, "-I", str(Path(__file__).with_name("_pdf_inspector.py"))],
+            input=data, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=PDF_INSPECTION_TIMEOUT, check=False,
+        )
+        if result.returncode or len(result.stdout) > 1024:
+            raise ValueError("PDF inspection worker failed")
+        report = json.loads(result.stdout)
+        if not isinstance(report, dict):
+            raise ValueError("Invalid PDF inspection report")
+        if report == {"error": "password"}:
+            raise FulltextStorageError(
+                "Password-protected PDFs are not supported. Upload an unlocked copy."
+            )
+        pages = report.get("pages")
+        if set(report) != {"pages"} or (pages is not None and (type(pages) is not int or pages < 0)):
+            raise ValueError("Invalid PDF inspection report")
+        return pages
+    except (OSError, subprocess.SubprocessError, ValueError):
+        # subprocess.run kills and reaps the worker on timeout.
+        raise FulltextStorageError(_PDF_INSPECTION_ERROR) from None
 
 
 def sha256(data: bytes) -> str:
@@ -110,8 +122,8 @@ def _client():
         from supabase import create_client
 
         return create_client(url, key)
-    except Exception as exc:
-        raise FulltextStorageError(f"Could not initialize Supabase Storage: {exc}") from exc
+    except Exception:
+        raise FulltextStorageError("Could not initialize PDF storage. Check the storage configuration.") from None
 
 
 def save_pdf(key: str, data: bytes) -> None:
@@ -125,16 +137,16 @@ def save_pdf(key: str, data: bytes) -> None:
                 file=data,
                 file_options={"content-type": "application/pdf", "upsert": "true"},
             )
-        except Exception as exc:
-            raise FulltextStorageError(f"Could not upload the PDF: {exc}") from exc
+        except Exception:
+            raise FulltextStorageError("Could not upload the PDF. Check storage or try again.") from None
         return
 
-    path = _safe_local_path(key)
-    path.parent.mkdir(parents=True, exist_ok=True)
     try:
+        path = _safe_local_path(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
-    except OSError as exc:
-        raise FulltextStorageError(f"Could not save the PDF locally: {exc}") from exc
+    except OSError:
+        raise FulltextStorageError("Could not save the PDF locally. Check storage permissions.") from None
 
 
 def load_pdf(key: str) -> bytes:
@@ -144,14 +156,14 @@ def load_pdf(key: str) -> bytes:
         _, _, bucket = config
         try:
             return bytes(_client().storage.from_(bucket).download(key))
-        except Exception as exc:
-            raise FulltextStorageError(f"Could not download the PDF: {exc}") from exc
+        except Exception:
+            raise FulltextStorageError("Could not download the PDF. Check storage or try again.") from None
 
-    path = _safe_local_path(key)
     try:
+        path = _safe_local_path(key)
         return path.read_bytes()
-    except OSError as exc:
-        raise FulltextStorageError(f"Could not open the stored PDF: {exc}") from exc
+    except OSError:
+        raise FulltextStorageError("Could not open the stored PDF. Reattach it or try again.") from None
 
 
 def delete_pdf(key: str | None) -> None:
@@ -163,12 +175,12 @@ def delete_pdf(key: str | None) -> None:
         _, _, bucket = config
         try:
             _client().storage.from_(bucket).remove([key])
-        except Exception as exc:
-            raise FulltextStorageError(f"Could not delete the stored PDF: {exc}") from exc
+        except Exception:
+            raise FulltextStorageError("Could not delete the stored PDF. Check storage or try again.") from None
         return
 
-    path = _safe_local_path(key)
     try:
+        path = _safe_local_path(key)
         path.unlink(missing_ok=True)
         # Remove now-empty paper/project/user folders, never the storage root.
         root = _local_root().resolve()
@@ -179,8 +191,8 @@ def delete_pdf(key: str | None) -> None:
             except OSError:
                 break
             parent = parent.parent
-    except OSError as exc:
-        raise FulltextStorageError(f"Could not delete the local PDF: {exc}") from exc
+    except OSError:
+        raise FulltextStorageError("Could not delete the local PDF. Check storage permissions.") from None
 
 
 def delete_many(keys: list[str]) -> None:

@@ -3,6 +3,7 @@ import streamlit as st
 st.set_page_config(page_title="AI Literature Review Platform", page_icon="🔎", layout="wide")
 
 from core import auth
+from features.extraction import drafts
 from features.workflow import state
 
 auth.require_login()
@@ -26,4 +27,10 @@ if state.active_id() and state.loaded() and st.session_state.pop("_go_workflow",
     first = ("views/abstract_screening.py" if state.mode() == state.MODE_PRISMA
              else "views/fulltext_screening.py")
     st.switch_page(first)
+if state.active_id() and state.loaded():
+    review_form = f"extraction:{state.active_id()}"
+    if navigation.title != extraction_page.title:
+        # Edits typed on the extraction page are kept before its form disappears.
+        drafts.leave(review_form)
+    drafts.resolve(review_form)
 navigation.run()
