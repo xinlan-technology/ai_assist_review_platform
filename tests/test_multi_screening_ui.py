@@ -25,7 +25,7 @@ def comparison_ui(screening_ui, monkeypatch):
         element(app, "checkbox", "Compare multiple models").check().run()
         element(app, "selectbox", "Provider 2").select(second_provider).run()
         if second_provider == "OpenAI":
-            element(app, "selectbox", "Model 2").select("gpt-4.1").run()
+            element(app, "selectbox", "Model 2").select("gpt-6-astra").run()
         element(app, "toggle", "Model comparison and run history").set_value(True).run()
         assert not app.exception
         return app
@@ -41,7 +41,7 @@ def comparison_button(app, stage):
 def test_two_models_save_separate_answers_and_only_confirmation_advances(comparison_ui, stage):
     render, _, model, persistence = comparison_ui
     model.side_effect = lambda provider, name, *args: {
-        "verdict": "exclude" if name == "gpt-4.1" else "include",
+        "verdict": "exclude" if name == "gpt-6-astra" else "include",
         "reason": f"Independent assessment from {name}.",
     }
     app = render(stage)
@@ -188,7 +188,7 @@ def test_three_models_count_calls_and_preserve_each_provider_identity(comparison
     element(app, "selectbox", "Number of models").select(3).run()
     # A duplicate is not another model and must not trigger duplicate charges.
     element(app, "selectbox", "Provider 3").select("OpenAI").run()
-    element(app, "selectbox", "Model 3").select("gpt-4.1-mini").run()
+    element(app, "selectbox", "Model 3").select("gpt-6.1-sol").run()
     assert comparison_button(app, stage).disabled
     element(app, "selectbox", "Provider 3").select("Google").run()
     assert comparison_button(app, stage).disabled
@@ -285,7 +285,7 @@ def test_comparison_respects_selected_papers(screening_ui, monkeypatch, stage):
     element(app, "text_input", "API key").input("offline-openai-key").run()
     element(app, "checkbox", "Compare multiple models").check().run()
     element(app, "selectbox", "Provider 2").select("OpenAI").run()
-    element(app, "selectbox", "Model 2").select("gpt-4.1").run()
+    element(app, "selectbox", "Model 2").select("gpt-6-astra").run()
     element(app, "toggle", "Model comparison and run history").set_value(True).run()
     assert comparison_button(app, stage).label == "Run model comparison (4 calls)"
     element(app, "checkbox", "All papers in this stage").uncheck().run()

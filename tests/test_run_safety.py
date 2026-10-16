@@ -174,19 +174,19 @@ def test_unknown_outcome_is_repeated_only_after_explicit_acceptance(screening_ui
 def test_a_pair_that_succeeded_is_not_retried_because_a_later_attempt_failed():
     paper = {"uid": "p1", "title": "T", "abstract": "A", "stages": {}}
     spec = {"criteria": "Include.", "prompt_version": "v1"}
-    base = {"paper_uid": "p1", "stage": "abstract", "provider": "OpenAI", "model": "gpt-4.1",
+    base = {"paper_uid": "p1", "stage": "abstract", "provider": "OpenAI", "model": "gpt-6-astra",
             "config_hash": runs.config_hash("abstract", spec),
             "source_hash": runs.source_hash("abstract", paper), "prompt_version": "v1"}
     records = [base | {"id": "1", "status": "succeeded"}, base | {"id": "2", "status": "call_failed"}]
-    model = [{"provider": "OpenAI", "model": "gpt-4.1", "api_key": "k"}]
+    model = [{"provider": "OpenAI", "model": "gpt-6-astra", "api_key": "k"}]
     pairs, succeeded = runs.outcomes([paper], "abstract", spec, None, records)
-    assert pairs == {("p1", "OpenAI", "gpt-4.1"): runs.REPEAT} and succeeded == {"p1"}
+    assert pairs == {("p1", "OpenAI", "gpt-6-astra"): runs.REPEAT} and succeeded == {"p1"}
     for category in (runs.NEW, runs.FAILED, runs.INVALID, runs.UNKNOWN):
         assert runs.plan([paper], "abstract", spec, None, model, records, include=(category,)) == []
     assert len(runs.plan([paper], "abstract", spec, None, model, records, repeat=True)) == 1
     later = [base | {"id": "1", "status": "call_failed"}, base | {"id": "2", "status": "running"}]
     assert runs.outcomes([paper], "abstract", spec, None, later)[0] == {
-        ("p1", "OpenAI", "gpt-4.1"): runs.UNKNOWN}
+        ("p1", "OpenAI", "gpt-6-astra"): runs.UNKNOWN}
 
 
 def test_extraction_invalid_retry_cannot_be_billed_twice(ui, monkeypatch):

@@ -5,32 +5,29 @@ import re
 import base64
 
 PROVIDERS: dict[str, list[str]] = {
-    "OpenAI": ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "gpt-4o"],
-    "Anthropic": ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"],
-    "Google": ["gemini-2.5-pro", "gemini-2.5-flash"],
+    "OpenAI": ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-luna"],
+    "Anthropic": ["claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-5-5", "claude-haiku-5-5"],
+    "Google": ["gemini-4-argon", "gemini-3.8-flash", "gemini-3.5-flash-lite"],
 }
 
 PROVIDER_KEY_HELP: dict[str, str] = {
     "OpenAI": "Create an API key at platform.openai.com (starts with sk-)",
-    "Anthropic": "Create an API key at console.anthropic.com (starts with sk-ant-)",
+    "Anthropic": "Create an API key at platform.claude.com (starts with sk-ant-)",
     "Google": "Create an API key at aistudio.google.com",
 }
 
 MAX_INLINE_PDF_BYTES = 19 * 1024 * 1024
 
-# Reserve output room for Gemini Pro reasoning; Flash can disable reasoning.
-GOOGLE_PRO_THINKING_BUDGET = 128
-GOOGLE_PRO_HEADROOM = 2048
+# Every listed model reasons before answering, and that reasoning counts toward
+# the output cap. "low" is accepted by all of them.
+REASONING_EFFORT = "low"
+# Keep the largest cap under 21,333 tokens: the Anthropic SDK rejects larger
+# non-streaming requests.
+REASONING_HEADROOM = 8192
 
 
-def _google_limits(model: str, max_output_tokens: int) -> tuple[int, int]:
-    """Return (output cap, thinking budget) for a Gemini request."""
-    if "pro" in (model or "").lower():
-        return (
-            max(int(max_output_tokens) + GOOGLE_PRO_HEADROOM, 4096),
-            GOOGLE_PRO_THINKING_BUDGET,
-        )
-    return int(max_output_tokens), 0
+def _output_cap(max_output_tokens: int) -> int:
+    return int(max_output_tokens) + REASONING_HEADROOM
 
 PDF_SCREENING_SCHEMA = {
     "type": "object",
@@ -170,6 +167,7 @@ def _call_openai(model: str, api_key: str, system: str, user: str) -> dict:
             {"role": "user", "content": user},
         ],
         response_format={"type": "json_object"},
+        reasoning_effort=REASONING_EFFORT,
     )
     if not resp.choices:
         raise InvalidModelResponse("OpenAI returned no choices")
@@ -184,13 +182,15 @@ def _call_anthropic(model: str, api_key: str, system: str, user: str) -> dict:
     import anthropic
 
     client = anthropic.Anthropic(api_key=api_key, max_retries=0)
+    cap = _output_cap(1024)
     resp = client.messages.create(
         model=model,
-        max_tokens=1024,
+        max_tokens=cap,
         system=system,
+        output_config={"effort": REASONING_EFFORT},
         messages=[{"role": "user", "content": user}],
     )
-    return _anthropic_result(resp)
+    return _anthropic_result(resp, cap)
 
 
 def _call_google(model: str, api_key: str, system: str, user: str) -> dict:
@@ -198,13 +198,13 @@ def _call_google(model: str, api_key: str, system: str, user: str) -> dict:
     from google.genai import types
 
     client = genai.Client(api_key=api_key)
-    # Leave reasoning uncapped here; the PDF path sets an explicit budget.
     resp = client.models.generate_content(
         model=model,
         contents=user,
         config=types.GenerateContentConfig(
             system_instruction=system,
             response_mime_type="application/json",
+            thinking_config=types.ThinkingConfig(thinking_level=REASONING_EFFORT),
         ),
     )
     return _google_result(resp)
@@ -230,9 +230,11 @@ def _call_openai_pdf(
     from openai import OpenAI
 
     client = OpenAI(api_key=api_key, max_retries=0)
+    cap = _output_cap(max_output_tokens)
     resp = client.responses.create(
         model=model,
-        max_output_tokens=max_output_tokens,
+        max_output_tokens=cap,
+        reasoning={"effort": REASONING_EFFORT},
         store=False,
         text={
             "format": {
@@ -257,7 +259,7 @@ def _call_openai_pdf(
             },
         ],
     )
-    _check_finished("OpenAI", getattr(resp, "status", None), "completed", max_output_tokens)
+    _check_finished("OpenAI", getattr(resp, "status", None), "completed", cap)
     for item in getattr(resp, "output", None) or []:
         for block in getattr(item, "content", None) or []:
             if getattr(block, "type", None) == "refusal":
@@ -280,11 +282,13 @@ def _call_anthropic_pdf(
     import anthropic
 
     client = anthropic.Anthropic(api_key=api_key, max_retries=0)
+    cap = _output_cap(max_output_tokens)
     resp = client.messages.create(
         model=model,
-        max_tokens=max_output_tokens,
+        max_tokens=cap,
         system=system,
         output_config={
+            "effort": REASONING_EFFORT,
             "format": {
                 "type": "json_schema",
                 "schema": anthropic.transform_schema(
@@ -309,7 +313,7 @@ def _call_anthropic_pdf(
             }
         ],
     )
-    return _anthropic_result(resp, max_output_tokens)
+    return _anthropic_result(resp, cap)
 
 
 def _call_google_pdf(
@@ -329,7 +333,7 @@ def _call_google_pdf(
 
     client = genai.Client(api_key=api_key)
     pdf_part = types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")
-    cap, thinking_budget = _google_limits(model, max_output_tokens)
+    cap = _output_cap(max_output_tokens)
     resp = client.models.generate_content(
         model=model,
         contents=[pdf_part, user],
@@ -338,7 +342,7 @@ def _call_google_pdf(
             response_mime_type="application/json",
             response_json_schema=schema if schema is not None else PDF_SCREENING_SCHEMA,
             max_output_tokens=cap,
-            thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget),
+            thinking_config=types.ThinkingConfig(thinking_level=REASONING_EFFORT),
         ),
     )
     return _google_result(resp, cap)
@@ -405,10 +409,8 @@ def pdf_input_issue(
     """Return why a stored PDF should not be sent to the selected model."""
     if int(file_size or 0) > MAX_INLINE_PDF_BYTES:
         return "larger than the 19 MB AI limit"
-    if provider == "Anthropic" and page_count:
-        page_limit = 100 if "haiku" in model.lower() else 600
-        if int(page_count) > page_limit:
-            return f"over the {page_limit}-page limit for {model}"
+    if provider == "Anthropic" and page_count and int(page_count) > 600:
+        return f"over the 600-page limit for {model}"
     if provider == "Google" and page_count and int(page_count) > 1000:
         return "over the 1000-page limit for Google"
     return None

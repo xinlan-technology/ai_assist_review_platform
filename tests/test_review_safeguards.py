@@ -134,7 +134,7 @@ def test_decision_history_export_lists_every_archived_screening_outcome(monkeypa
     paper = state.new_paper("10.1000/abc", "Study", "Abstract")
     for round_number, verdict in enumerate(["include", "exclude", "include"]):
         state.set_ai_result(paper, state.STAGE_ABSTRACT, verdict, f"Reason {round_number}",
-                            "OpenAI", "gpt-4.1", f"hash-{round_number}", "v1")
+                            "OpenAI", "gpt-6-astra", f"hash-{round_number}", "v1")
         state.stage_state(paper, state.STAGE_ABSTRACT)["source_run_id"] = f"run-{round_number}"
         state.record_agree(paper, state.STAGE_ABSTRACT)
         state.archive_ai_result(paper, state.STAGE_ABSTRACT)

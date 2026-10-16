@@ -170,14 +170,14 @@ def test_pdf_providers_receive_dynamic_schema_and_token_limit(monkeypatch, provi
     if provider == "OpenAI":
         assert seen["text"]["format"]["schema"] == schema
         assert seen["text"]["format"]["name"] == "custom_extraction"
-        assert seen["max_output_tokens"] == 4200
+        assert seen["max_output_tokens"] == 4200 + llm.REASONING_HEADROOM
         assert seen["store"] is False
     elif provider == "Anthropic":
         assert seen["output_config"]["format"]["schema"] == schema
-        assert seen["max_tokens"] == 4200
+        assert seen["max_tokens"] == 4200 + llm.REASONING_HEADROOM
     else:
         assert seen["config"].response_json_schema == schema
-        assert seen["config"].max_output_tokens == 4200
+        assert seen["config"].max_output_tokens == 4200 + llm.REASONING_HEADROOM
 
 
 def test_anthropic_removes_unsupported_schema_constraints(monkeypatch):
@@ -271,16 +271,14 @@ def test_google_rejects_prompt_block(monkeypatch):
         llm._call_google_pdf("m", "k", "s", "u", PDF, "p.pdf")
 
 
-def test_pdf_input_issue_enforces_size_and_claude_page_limits():
-    assert llm.pdf_input_issue("OpenAI", "gpt-4.1", 1, 999) is None
+def test_pdf_input_issue_enforces_size_and_page_limits():
+    assert llm.pdf_input_issue("OpenAI", "gpt-6.1-sol", 1, 999) is None
     assert "19 MB" in llm.pdf_input_issue(
-        "Google", "gemini-2.5-flash", llm.MAX_INLINE_PDF_BYTES + 1, 1
+        "Google", "gemini-3.8-flash", llm.MAX_INLINE_PDF_BYTES + 1, 1
     )
-    assert "100-page" in llm.pdf_input_issue(
-        "Anthropic", "claude-haiku-4-5", 1, 101
-    )
+    assert llm.pdf_input_issue("Anthropic", "claude-haiku-5-5", 1, 600) is None
     assert "600-page" in llm.pdf_input_issue(
-        "Anthropic", "claude-sonnet-4-6", 1, 601
+        "Anthropic", "claude-haiku-5-5", 1, 601
     )
-    assert llm.pdf_input_issue("Google", "gemini-2.5-flash", 1, 1000) is None
-    assert "1000-page" in llm.pdf_input_issue("Google", "gemini-2.5-flash", 1, 1001)
+    assert llm.pdf_input_issue("Google", "gemini-3.8-flash", 1, 1000) is None
+    assert "1000-page" in llm.pdf_input_issue("Google", "gemini-3.8-flash", 1, 1001)

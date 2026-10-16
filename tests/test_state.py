@@ -22,7 +22,7 @@ def _paper(**stage_fields) -> dict:
 
 
 def _ai(paper, stage=A, verdict=state.VERDICT_INCLUDE, chash=HASH_A):
-    state.set_ai_result(paper, stage, verdict, "r", "OpenAI", "gpt-4o", chash, "abstract-v2")
+    state.set_ai_result(paper, stage, verdict, "r", "OpenAI", "gpt-6-luna", chash, "abstract-v2")
 
 
 def test_v1_migration():
@@ -266,7 +266,7 @@ def test_archive_covers_human_only_decisions():
 def test_replacing_pdf_archives_old_fulltext_outcome():
     p = _paper()
     state.set_ai_result(
-        p, F, state.VERDICT_INCLUDE, "r", "OpenAI", "gpt-4o", HASH_A, "fulltext-v1"
+        p, F, state.VERDICT_INCLUDE, "r", "OpenAI", "gpt-6-luna", HASH_A, "fulltext-v1"
     )
     state.record_agree(p, F)
     assert state.archive_if_source_changed(p, F, "old-pdf", "new-pdf")

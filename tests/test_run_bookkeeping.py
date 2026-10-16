@@ -110,7 +110,7 @@ def _legacy_project():
     paper = state.new_paper("", "Study", "Abstract")
     paper["uid"] = "paper-1"
     paper["stages"]["abstract"] = {"ai_verdict": "include", "ai_reason": "Earlier answer.",
-                                   "provider": "OpenAI", "model": "gpt-4.1", "criteria_hash": "h"}
+                                   "provider": "OpenAI", "model": "gpt-6-astra", "criteria_hash": "h"}
     data = state.new_project_data(state.MODE_PRISMA)
     data.pop(state._RUNS_MIGRATED_KEY)
     data["papers"] = [paper]
@@ -163,7 +163,7 @@ def test_screening_history_keeps_every_archived_decision():
     paper = state.new_paper("", "Study", "Abstract")
     for round_number in range(14):
         state.set_ai_result(paper, state.STAGE_ABSTRACT, "include", f"Round {round_number}",
-                            "OpenAI", "gpt-4.1", f"hash-{round_number}", "v1")
+                            "OpenAI", "gpt-6-astra", f"hash-{round_number}", "v1")
         state.record_agree(paper, state.STAGE_ABSTRACT)
         state.archive_ai_result(paper, state.STAGE_ABSTRACT)
     history = state.stage_state(paper, state.STAGE_ABSTRACT)["history"]

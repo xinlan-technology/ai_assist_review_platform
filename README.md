@@ -353,3 +353,7 @@ retention settings; check these before admitting users.
 Projects saved by the earlier score-based version are migrated on open: scores
 become Include/Exclude verdicts against the saved threshold, and the topic and
 rubric become editable criteria text.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

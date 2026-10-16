@@ -21,8 +21,8 @@ from features.workflow import run_controls, runs, state
 
 SPEC = {"criteria": "Include field studies.", "prompt_version": prompts.ABSTRACT_PROMPT_VERSION}
 MODELS = [
-    {"provider": "OpenAI", "model": "gpt-4.1-mini", "api_key": "offline-openai-secret"},
-    {"provider": "Anthropic", "model": "claude-haiku-4-5", "api_key": "offline-anthropic-secret"},
+    {"provider": "OpenAI", "model": "gpt-6.1-sol", "api_key": "offline-openai-secret"},
+    {"provider": "Anthropic", "model": "claude-haiku-5-5", "api_key": "offline-anthropic-secret"},
 ]
 PDF = b"%PDF-1.7\nmock-document"
 EXTRACTION_SPEC = schema.build_spec("Find the setting.", [{
@@ -383,7 +383,7 @@ def test_project_deletion_during_paid_call_does_not_recreate_or_leak_project(pro
 def test_plan_applies_pdf_limits_per_paper_and_model(project):
     first, second = state.papers()
     metadata = deepcopy(project.metadata)
-    metadata[first["uid"]]["page_count"] = 101
+    metadata[first["uid"]]["page_count"] = 601
     metadata[second["uid"]]["file_size"] = MAX_INLINE_PDF_BYTES + 1
     spec = {"criteria": SPEC["criteria"], "prompt_version": prompts.FULLTEXT_PROMPT_VERSION}
     tasks = runs.plan(state.papers(), "fulltext", spec, metadata, MODELS, [])
@@ -428,7 +428,7 @@ def test_known_legacy_results_import_without_becoming_new_human_decisions(projec
     # Results recorded before attempts existed are imported by the project's first save.
     state._store()[state._RUNS_MIGRATED_KEY] = False
     paper = state.papers()[0]
-    state.set_ai_result(paper, "abstract", "exclude", "Older AI rationale", "OpenAI", "gpt-4.1-mini",
+    state.set_ai_result(paper, "abstract", "exclude", "Older AI rationale", "OpenAI", "gpt-6.1-sol",
                         state.criteria_hash(SPEC["criteria"]), SPEC["prompt_version"])
     state.record_agree(paper, "abstract")
     original = deepcopy(state.stage_state(paper, "abstract"))
